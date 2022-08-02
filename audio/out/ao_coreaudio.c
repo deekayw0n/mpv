@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <CoreAudio/HostTime.h>
@@ -23,7 +23,6 @@
 #include "audio/format.h"
 #include "osdep/timer.h"
 #include "options/m_option.h"
-#include "misc/ring.h"
 #include "common/msg.h"
 #include "ao_coreaudio_chmap.h"
 #include "ao_coreaudio_properties.h"
@@ -117,8 +116,6 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
         return get_volume(ao, arg);
     case AOCONTROL_SET_VOLUME:
         return set_volume(ao, arg);
-    case AOCONTROL_HAS_SOFT_VOLUME:
-        return CONTROL_TRUE;
     }
     return CONTROL_UNKNOWN;
 }
@@ -419,13 +416,13 @@ const struct ao_driver audio_out_coreaudio = {
     .init           = init,
     .control        = control,
     .reset          = stop,
-    .resume         = start,
+    .start          = start,
     .hotplug_init   = hotplug_init,
     .hotplug_uninit = hotplug_uninit,
     .list_devs      = ca_get_device_list,
     .priv_size      = sizeof(struct priv),
     .options = (const struct m_option[]){
-        OPT_FLAG("change-physical-format", change_physical_format, 0),
+        {"change-physical-format", OPT_FLAG(change_physical_format)},
         {0}
     },
     .options_prefix = "coreaudio",

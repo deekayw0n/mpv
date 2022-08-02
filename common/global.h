@@ -8,10 +8,8 @@ struct mpv_global {
     struct mp_log *log;
     struct m_config_shadow *config;
     struct mp_client_api *client_api;
-
-    // Using this is deprecated and should be avoided (missing synchronization).
-    // Use m_config_cache to access mpv_global.config instead.
-    struct MPOpts *opts;
+    char *configdir;
+    struct stats_base *stats;
 };
 
 #endif

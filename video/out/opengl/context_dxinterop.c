@@ -22,6 +22,7 @@
 #include "osdep/windows_utils.h"
 #include "video/out/w32_common.h"
 #include "context.h"
+#include "utils.h"
 
 // For WGL_ACCESS_WRITE_DISCARD_NV, etc.
 #include <GL/wglext.h>
@@ -35,6 +36,8 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 #endif
 
 struct priv {
+    GL gl;
+
     HMODULE d3d9_dll;
     HRESULT (WINAPI *Direct3DCreate9Ex)(UINT SDKVersion, IDirect3D9Ex **ppD3D);
 
@@ -54,6 +57,7 @@ struct priv {
 
     // OpenGL resources
     GLuint texture;
+    GLuint main_fb;
 
     // Did we lose the device?
     bool lost_device;
@@ -63,7 +67,7 @@ struct priv {
     int width, height, swapinterval;
 };
 
-static __thread struct MPGLContext *current_ctx;
+static __thread struct ra_ctx *current_ctx;
 
 static void pump_message_loop(void)
 {
@@ -84,10 +88,11 @@ static void *w32gpa(const GLubyte *procName)
     return GetProcAddress(oglmod, procName);
 }
 
-static int os_ctx_create(struct MPGLContext *ctx)
+static int os_ctx_create(struct ra_ctx *ctx)
 {
     static const wchar_t os_wnd_class[] = L"mpv offscreen gl";
     struct priv *p = ctx->priv;
+    GL *gl = &p->gl;
     HGLRC legacy_context = NULL;
 
     RegisterClassExW(&(WNDCLASSEXW) {
@@ -143,7 +148,7 @@ static int os_ctx_create(struct MPGLContext *ctx)
     }
 
     const char *wgl_exts = wglGetExtensionsStringARB(p->os_dc);
-    if (!strstr(wgl_exts, "WGL_ARB_create_context")) {
+    if (!gl_check_extension(wgl_exts, "WGL_ARB_create_context")) {
         MP_FATAL(ctx->vo, "The OpenGL driver does not support OpenGL 3.x\n");
         goto fail;
     }
@@ -190,8 +195,8 @@ static int os_ctx_create(struct MPGLContext *ctx)
         goto fail;
     }
 
-    mpgl_load_functions(ctx->gl, w32gpa, wgl_exts, ctx->vo->log);
-    if (!(ctx->gl->mpgl_caps & MPGL_CAP_DXINTEROP)) {
+    mpgl_load_functions(gl, w32gpa, wgl_exts, ctx->vo->log);
+    if (!(gl->mpgl_caps & MPGL_CAP_DXINTEROP)) {
         MP_FATAL(ctx->vo, "WGL_NV_DX_interop is not supported\n");
         goto fail;
     }
@@ -205,7 +210,7 @@ fail:
     return -1;
 }
 
-static void os_ctx_destroy(MPGLContext *ctx)
+static void os_ctx_destroy(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
 
@@ -219,10 +224,10 @@ static void os_ctx_destroy(MPGLContext *ctx)
         DestroyWindow(p->os_wnd);
 }
 
-static int d3d_size_dependent_create(MPGLContext *ctx)
+static int d3d_size_dependent_create(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    struct GL *gl = ctx->gl;
+    GL *gl = &p->gl;
     HRESULT hr;
 
     IDirect3DSwapChain9 *sw9;
@@ -235,12 +240,12 @@ static int d3d_size_dependent_create(MPGLContext *ctx)
     hr = IDirect3DSwapChain9_QueryInterface(sw9, &IID_IDirect3DSwapChain9Ex,
         (void**)&p->swapchain);
     if (FAILED(hr)) {
-        IDirect3DSwapChain9_Release(sw9);
+        SAFE_RELEASE(sw9);
         MP_ERR(ctx->vo, "Obtained swap chain is not IDirect3DSwapChain9Ex: %s\n",
                mp_HRESULT_to_str(hr));
         return -1;
     }
-    IDirect3DSwapChain9_Release(sw9);
+    SAFE_RELEASE(sw9);
 
     hr = IDirect3DSwapChain9Ex_GetBackBuffer(p->swapchain, 0,
         D3DBACKBUFFER_TYPE_MONO, &p->backbuffer);
@@ -294,7 +299,7 @@ static int d3d_size_dependent_create(MPGLContext *ctx)
         return -1;
     }
 
-    gl->BindFramebuffer(GL_FRAMEBUFFER, gl->main_fb);
+    gl->BindFramebuffer(GL_FRAMEBUFFER, p->main_fb);
     gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
         GL_TEXTURE_2D, p->texture, 0);
     gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -302,10 +307,10 @@ static int d3d_size_dependent_create(MPGLContext *ctx)
     return 0;
 }
 
-static void d3d_size_dependent_destroy(MPGLContext *ctx)
+static void d3d_size_dependent_destroy(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    struct GL *gl = ctx->gl;
+    GL *gl = &p->gl;
 
     if (p->rtarget_h) {
         gl->DXUnlockObjectsNV(p->device_h, 1, &p->rtarget_h);
@@ -315,18 +320,14 @@ static void d3d_size_dependent_destroy(MPGLContext *ctx)
     if (p->texture)
         gl->DeleteTextures(1, &p->texture);
     p->texture = 0;
-    if (p->rtarget)
-        IDirect3DSurface9_Release(p->rtarget);
-    p->rtarget = NULL;
-    if (p->backbuffer)
-        IDirect3DSurface9_Release(p->backbuffer);
-    p->backbuffer = NULL;
-    if (p->swapchain)
-        IDirect3DSwapChain9Ex_Release(p->swapchain);
-    p->swapchain = NULL;
+
+    SAFE_RELEASE(p->rtarget);
+    SAFE_RELEASE(p->backbuffer);
+    SAFE_RELEASE(p->swapchain);
 }
 
-static void fill_presentparams(MPGLContext *ctx, D3DPRESENT_PARAMETERS *pparams)
+static void fill_presentparams(struct ra_ctx *ctx,
+                               D3DPRESENT_PARAMETERS *pparams)
 {
     struct priv *p = ctx->priv;
 
@@ -343,13 +344,9 @@ static void fill_presentparams(MPGLContext *ctx, D3DPRESENT_PARAMETERS *pparams)
         .Windowed = TRUE,
         .BackBufferWidth = ctx->vo->dwidth ? ctx->vo->dwidth : 1,
         .BackBufferHeight = ctx->vo->dheight ? ctx->vo->dheight : 1,
-        // The length of the backbuffer queue shouldn't affect latency because
-        // swap_buffers() always uses the backbuffer at the head of the queue
-        // and presents it immediately. MSDN says there is a performance
-        // penalty for having a short backbuffer queue and this seems to be
-        // true, at least on Nvidia, where less than four backbuffers causes
-        // very high CPU usage. Use six to be safe.
-        .BackBufferCount = 6,
+        // Add one frame for the backbuffer and one frame of "slack" to reduce
+        // contention with the window manager when acquiring the backbuffer
+        .BackBufferCount = ctx->vo->opts->swapchain_depth + 2,
         .SwapEffect = IsWindows7OrGreater() ? D3DSWAPEFFECT_FLIPEX : D3DSWAPEFFECT_FLIP,
         // Automatically get the backbuffer format from the display format
         .BackBufferFormat = D3DFMT_UNKNOWN,
@@ -358,10 +355,10 @@ static void fill_presentparams(MPGLContext *ctx, D3DPRESENT_PARAMETERS *pparams)
     };
 }
 
-static int d3d_create(MPGLContext *ctx)
+static int d3d_create(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    struct GL *gl = ctx->gl;
+    GL *gl = &p->gl;
     HRESULT hr;
 
     p->d3d9_dll = LoadLibraryW(L"d3d9.dll");
@@ -401,8 +398,7 @@ static int d3d_create(MPGLContext *ctx)
         return -1;
     }
 
-    // mpv expects frames to be presented right after swap_buffers() returns
-    IDirect3DDevice9Ex_SetMaximumFrameLatency(p->device, 1);
+    IDirect3DDevice9Ex_SetMaximumFrameLatency(p->device, ctx->vo->opts->swapchain_depth);
 
     // Register the Direct3D device with WGL_NV_dx_interop
     p->device_h = gl->DXOpenDeviceNV(p->device);
@@ -415,23 +411,22 @@ static int d3d_create(MPGLContext *ctx)
     return 0;
 }
 
-static void d3d_destroy(MPGLContext *ctx)
+static void d3d_destroy(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    struct GL *gl = ctx->gl;
+    GL *gl = &p->gl;
 
     if (p->device_h)
         gl->DXCloseDeviceNV(p->device_h);
-    if (p->device)
-        IDirect3DDevice9Ex_Release(p->device);
-    if (p->d3d9ex)
-        IDirect3D9Ex_Release(p->d3d9ex);
+    SAFE_RELEASE(p->device);
+    SAFE_RELEASE(p->d3d9ex);
     if (p->d3d9_dll)
         FreeLibrary(p->d3d9_dll);
 }
 
-static void dxinterop_uninit(MPGLContext *ctx)
+static void dxgl_uninit(struct ra_ctx *ctx)
 {
+    ra_gl_ctx_uninit(ctx);
     d3d_size_dependent_destroy(ctx);
     d3d_destroy(ctx);
     os_ctx_destroy(ctx);
@@ -440,7 +435,7 @@ static void dxinterop_uninit(MPGLContext *ctx)
     pump_message_loop();
 }
 
-static void dxinterop_reset(struct MPGLContext *ctx)
+static void dxgl_reset(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
     HRESULT hr;
@@ -475,85 +470,28 @@ static void dxinterop_reset(struct MPGLContext *ctx)
     p->lost_device = false;
 }
 
-static int GLAPIENTRY dxinterop_swap_interval(int interval)
+static int GLAPIENTRY dxgl_swap_interval(int interval)
 {
     if (!current_ctx)
         return 0;
     struct priv *p = current_ctx->priv;
 
     p->requested_swapinterval = interval;
-    dxinterop_reset(current_ctx);
+    dxgl_reset(current_ctx);
     return 1;
 }
 
-static void * GLAPIENTRY dxinterop_get_native_display(const char *name)
-{
-    if (!current_ctx || !name)
-        return NULL;
-    struct priv *p = current_ctx->priv;
-
-    if (p->device && strcmp("IDirect3DDevice9Ex", name) == 0) {
-        return p->device;
-    } else if (p->device_h && strcmp("dxinterop_device_HANDLE", name) == 0) {
-        return p->device_h;
-    }
-    return NULL;
-}
-
-static int dxinterop_init(struct MPGLContext *ctx, int flags)
+static void dxgl_swap_buffers(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    struct GL *gl = ctx->gl;
-
-    p->requested_swapinterval = 1;
-
-    if (!vo_w32_init(ctx->vo))
-        goto fail;
-    if (os_ctx_create(ctx) < 0)
-        goto fail;
-
-    // Create the shared framebuffer
-    gl->GenFramebuffers(1, &gl->main_fb);
-
-    current_ctx = ctx;
-    gl->SwapInterval = dxinterop_swap_interval;
-    gl->MPGetNativeDisplay = dxinterop_get_native_display;
-
-    if (d3d_create(ctx) < 0)
-        goto fail;
-    if (d3d_size_dependent_create(ctx) < 0)
-        goto fail;
-
-    // The OpenGL and Direct3D coordinate systems are flipped vertically
-    // relative to each other. Flip the video during rendering so it can be
-    // copied to the Direct3D backbuffer with a simple (and fast) StretchRect.
-    ctx->flip_v = true;
-
-    DwmEnableMMCSS(TRUE);
-
-    return 0;
-fail:
-    dxinterop_uninit(ctx);
-    return -1;
-}
-
-static int dxinterop_reconfig(struct MPGLContext *ctx)
-{
-    vo_w32_config(ctx->vo);
-    return 0;
-}
-
-static void dxinterop_swap_buffers(MPGLContext *ctx)
-{
-    struct priv *p = ctx->priv;
-    struct GL *gl = ctx->gl;
+    GL *gl = &p->gl;
     HRESULT hr;
 
     pump_message_loop();
 
     // If the device is still lost, try to reset it again
     if (p->lost_device)
-        dxinterop_reset(ctx);
+        dxgl_reset(ctx);
     if (p->lost_device)
         return;
 
@@ -572,41 +510,96 @@ static void dxinterop_swap_buffers(MPGLContext *ctx)
         return;
     }
 
-    if (!gl->DXLockObjectsNV(p->device_h, 1, &p->rtarget_h)) {
-        MP_ERR(ctx->vo, "Couldn't lock rendertarget after stretchrect: %s\n",
-               mp_LastError_to_str());
-        return;
-    }
-
     hr = IDirect3DDevice9Ex_PresentEx(p->device, NULL, NULL, NULL, NULL, 0);
     switch (hr) {
     case D3DERR_DEVICELOST:
     case D3DERR_DEVICEHUNG:
         MP_VERBOSE(ctx->vo, "Direct3D device lost! Resetting.\n");
         p->lost_device = true;
-        dxinterop_reset(ctx);
-        break;
+        dxgl_reset(ctx);
+        return;
     default:
         if (FAILED(hr))
             MP_ERR(ctx->vo, "Failed to present: %s\n", mp_HRESULT_to_str(hr));
     }
+
+    if (!gl->DXLockObjectsNV(p->device_h, 1, &p->rtarget_h)) {
+        MP_ERR(ctx->vo, "Couldn't lock rendertarget after present: %s\n",
+               mp_LastError_to_str());
+    }
 }
 
-static int dxinterop_control(MPGLContext *ctx, int *events, int request,
+static bool dxgl_init(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
+    GL *gl = &p->gl;
+
+    p->requested_swapinterval = 1;
+
+    if (!vo_w32_init(ctx->vo))
+        goto fail;
+    if (os_ctx_create(ctx) < 0)
+        goto fail;
+
+    // Create the shared framebuffer
+    gl->GenFramebuffers(1, &p->main_fb);
+
+    current_ctx = ctx;
+    gl->SwapInterval = dxgl_swap_interval;
+
+    if (d3d_create(ctx) < 0)
+        goto fail;
+    if (d3d_size_dependent_create(ctx) < 0)
+        goto fail;
+
+    static const struct ra_swapchain_fns empty_swapchain_fns = {0};
+    struct ra_gl_ctx_params params = {
+        .swap_buffers = dxgl_swap_buffers,
+        .flipped = true,
+        .external_swapchain = &empty_swapchain_fns,
+    };
+
+    if (!ra_gl_ctx_init(ctx, gl, params))
+        goto fail;
+
+    ra_add_native_resource(ctx->ra, "IDirect3DDevice9Ex", p->device);
+    ra_add_native_resource(ctx->ra, "dxinterop_device_HANDLE", p->device_h);
+
+    DwmEnableMMCSS(TRUE);
+    return true;
+fail:
+    dxgl_uninit(ctx);
+    return false;
+}
+
+static void resize(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    dxgl_reset(ctx);
+    ra_gl_ctx_resize(ctx->swapchain, ctx->vo->dwidth, ctx->vo->dheight, p->main_fb);
+}
+
+static bool dxgl_reconfig(struct ra_ctx *ctx)
+{
+    vo_w32_config(ctx->vo);
+    resize(ctx);
+    return true;
+}
+
+static int dxgl_control(struct ra_ctx *ctx, int *events, int request,
                              void *arg)
 {
-    int r = vo_w32_control(ctx->vo, events, request, arg);
+    int ret = vo_w32_control(ctx->vo, events, request, arg);
     if (*events & VO_EVENT_RESIZE)
-        dxinterop_reset(ctx);
-    return r;
+        resize(ctx);
+    return ret;
 }
 
-const struct mpgl_driver mpgl_driver_dxinterop = {
+const struct ra_ctx_fns ra_ctx_dxgl = {
+    .type         = "opengl",
     .name         = "dxinterop",
-    .priv_size    = sizeof(struct priv),
-    .init         = dxinterop_init,
-    .reconfig     = dxinterop_reconfig,
-    .swap_buffers = dxinterop_swap_buffers,
-    .control      = dxinterop_control,
-    .uninit       = dxinterop_uninit,
+    .init         = dxgl_init,
+    .reconfig     = dxgl_reconfig,
+    .control      = dxgl_control,
+    .uninit       = dxgl_uninit,
 };

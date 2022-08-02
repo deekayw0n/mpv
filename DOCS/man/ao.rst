@@ -14,8 +14,7 @@ in the list.
 
     See ``--ao=help`` for a list of compiled-in audio output drivers. The
     driver ``--ao=alsa`` is preferred. ``--ao=pulse`` is preferred on systems
-    where PulseAudio is used. On BSD systems, ``--ao=oss`` or ``--ao=sndio``
-    may work (the latter being experimental).
+    where PulseAudio is used. On BSD systems, ``--ao=oss`` is preferred.
 
 Available audio output drivers are:
 
@@ -27,29 +26,18 @@ Available audio output drivers are:
     .. warning::
 
         To get multichannel/surround audio, use ``--audio-channels=auto``. The
-        default for this option is ``auto-safe``, which makes this audio otuput
+        default for this option is ``auto-safe``, which makes this audio output
         explicitly reject multichannel output, as there is no way to detect
         whether a certain channel layout is actually supported.
 
-        You can also try `using the upmix plugin <http://git.io/vfuAy>`_.
+        You can also try `using the upmix plugin
+        <https://github.com/mpv-player/mpv/wiki/ALSA-Surround-Sound-and-Upmixing>`_.
         This setup enables multichannel audio on the ``default`` device
         with automatic upmixing with shared access, so playing stereo
         and multichannel audio at the same time will work as expected.
 
 ``oss``
     OSS audio output driver
-
-    The following global options are supported by this audio output:
-
-    ``--oss-device``
-        Sets the audio output device (default: ``/dev/dsp``).
-        Deprecated, use ``--audio-device``.
-    ``--oss-mixer-device``
-        Sets the audio mixer device (default: ``/dev/mixer``).
-    ``--oss-mixer-channel``
-        Sets the audio mixer channel (default: ``pcm``). Other valid values
-        include **vol, pcm, line**. For a complete list of options look for
-        ``SOUND_DEVICE_NAMES`` in ``/usr/include/linux/soundcard.h``.
 
 ``jack``
     JACK (Jack Audio Connection Kit) audio output driver.
@@ -81,8 +69,8 @@ Available audio output drivers are:
         mode is probably not very useful, other than for debugging or when used
         with fixed setups.
 
-``coreaudio`` (Mac OS X only)
-    Native Mac OS X audio output driver using AudioUnits and the CoreAudio
+``coreaudio`` (macOS only)
+    Native macOS audio output driver using AudioUnits and the CoreAudio
     sound server.
 
     Automatically redirects to ``coreaudio_exclusive`` when playing compressed
@@ -98,39 +86,49 @@ Available audio output drivers are:
         setting in the ``Audio Devices`` dialog in the ``Audio MIDI Setup``
         utility. Note that this does not affect the selected speaker setup.
 
-    ``--coreaudio-exclusive``
-        Deprecated, use ``--audio-exclusive``.
-        Use exclusive mode access. This merely redirects to
-        ``coreaudio_exclusive``, but should be preferred over using that AO
-        directly.
+    ``--coreaudio-spdif-hack=<yes|no>``
+        Try to pass through AC3/DTS data as PCM. This is useful for drivers
+        which do not report AC3 support. It converts the AC3 data to float,
+        and assumes the driver will do the inverse conversion, which means
+        a typical A/V receiver will pick it up as compressed IEC framed AC3
+        stream, ignoring that it's marked as PCM. This disables normal AC3
+        passthrough (even if the device reports it as supported). Use with
+        extreme care.
 
 
-``coreaudio_exclusive`` (Mac OS X only)
-    Native Mac OS X audio output driver using direct device access and
+``coreaudio_exclusive`` (macOS only)
+    Native macOS audio output driver using direct device access and
     exclusive mode (bypasses the sound server).
 
 ``openal``
-    Experimental OpenAL audio output driver
+    OpenAL audio output driver.
 
-    .. note:: This driver is not very useful. Playing multi-channel audio with
-              it is slow.
+    ``--openal-num-buffers=<2-128>``
+        Specify the number of audio buffers to use. Lower values are better for
+        lower CPU usage. Default: 4.
+
+    ``--openal-num-samples=<256-32768>``
+        Specify the number of complete samples to use for each buffer. Higher
+        values are better for lower CPU usage. Default: 8192.
+
+    ``--openal-direct-channels=<yes|no>``
+        Enable OpenAL Soft's direct channel extension when available to avoid
+        tinting the sound with ambisonics or HRTF. Default: yes.
 
 ``pulse``
     PulseAudio audio output driver
 
     The following global options are supported by this audio output:
 
-    ``--pulse-host=<host>``, ``--pulse-sink=<sink>``
-        Specify the host and optionally output sink to use. An empty <host>
-        string uses a local connection, "localhost" uses network transfer
-        (most likely not what you want).
-        Deprecated, use ``--audio-device``.
+    ``--pulse-host=<host>``
+        Specify the host to use. An empty <host> string uses a local connection,
+        "localhost" uses network transfer (most likely not what you want).
 
     ``--pulse-buffer=<1-2000|native>``
         Set the audio buffer size in milliseconds. A higher value buffers
         more data, and has a lower probability of buffer underruns. A smaller
         value makes the audio stream react faster, e.g. to playback speed
-        changes. Default: 250.
+        changes.
 
     ``--pulse-latency-hacks=<yes|no>``
         Enable hacks to workaround PulseAudio timing bugs (default: no). If
@@ -142,6 +140,21 @@ Available audio output drivers are:
 
         If you have stuttering video when using pulse, try to enable this
         option. (Or try to update PulseAudio.)
+
+    ``--pulse-allow-suspended=<yes|no>``
+        Allow mpv to use PulseAudio even if the sink is suspended (default: no).
+        Can be useful if PulseAudio is running as a bridge to jack and mpv has its sink-input set to the one jack is using.
+
+``pipewire``
+    PipeWire audio output driver
+
+    The following global options are supported by this audio output:
+
+    ``--pipewire-buffer=<1-2000|native>``
+        Set the audio buffer size in milliseconds. A higher value buffers
+        more data, and has a lower probability of buffer underruns. A smaller
+        value makes the audio stream react faster, e.g. to playback speed
+        changes.
 
 ``sdl``
     SDL 1.2+ audio output driver. Should work on any platform supported by SDL
@@ -159,10 +172,6 @@ Available audio output drivers are:
         sound system. Playing a file with ``-v`` will show the requested and
         obtained exact buffer size. A value of 0 selects the sound system
         default.
-
-    ``--sdl-bufcnt=<count>``
-        Sets the number of extra audio buffers in mpv. Usually needs not be
-        changed.
 
 ``null``
     Produces no audio output but maintains video playback speed. You can use
@@ -200,6 +209,9 @@ Available audio output drivers are:
         If not empty, this is a ``,`` separated list of channel layouts the
         AO allows. This can be used to test channel layout selection.
 
+    ``--ao-null-format``
+        Force the audio output format the AO will accept. If unset accepts any.
+
 ``pcm``
     Raw PCM/WAVE file writer audio output
 
@@ -217,56 +229,11 @@ Available audio output drivers are:
         ``no-waveheader`` option - with ``waveheader`` it's broken, because
         it will write a WAVE header every time the file is opened.
 
-``rsound``
-    Audio output to an RSound daemon
-
-    .. note:: Completely useless, unless you intend to run RSound. Not to be
-              confused with RoarAudio, which is something completely
-              different.
-
-    The following global options are supported by this audio output:
-
-    ``--rsound-host=<name/path>``
-        Set the address of the server (default: localhost).  Can be either a
-        network hostname for TCP connections or a Unix domain socket path
-        starting with '/'.
-    ``--rsound-port=<number>``
-        Set the TCP port used for connecting to the server (default: 12345).
-        Not used if connecting to a Unix domain socket.
-
-    These options are deprecated. If anyone cares enough, their functionality
-    can be added back using ``--audio-device``.
-
 ``sndio``
     Audio output to the OpenBSD sndio sound system
-
-    .. note:: Experimental. There are known bugs and issues.
 
     (Note: only supports mono, stereo, 4.0, 5.1 and 7.1 channel
     layouts.)
 
-    The following global options are supported by this audio output:
-
-    ``--ao-sndio-device=<device>``
-        sndio device to use (default: ``$AUDIODEVICE``, resp. ``snd0``).
-        Deprecated, use ``--audio-device``.
-
 ``wasapi``
     Audio output to the Windows Audio Session API.
-
-    The following global options are supported by this audio output:
-
-    ``--ao-wasapi-exclusive``
-        Deprecated, use ``--audio-exclusive``.
-        Requests exclusive, direct hardware access. By definition prevents
-        sound playback of any other program until mpv exits.
-    ``--ao-wasapi-device=<id>``
-        Deprecated, use ``--audio-device``.
-
-        Uses the requested endpoint instead of the system's default audio
-        endpoint. Both an ordinal number (0,1,2,...) and the GUID
-        String are valid; the GUID string is guaranteed to not change
-        unless the driver is uninstalled.
-
-        Also supports searching active devices by human-readable name. If more
-        than one device matches the name, refuses loading it.

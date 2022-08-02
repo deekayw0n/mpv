@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 /*
@@ -31,6 +31,8 @@
 #if HAVE_COREAUDIO
 #include "audio/out/ao_coreaudio_properties.h"
 #include <CoreAudio/HostTime.h>
+#else
+#include <mach/mach_time.h>
 #endif
 
 CFStringRef cfstr_from_cstr(char *str)
@@ -310,9 +312,9 @@ int64_t ca_frames_to_us(struct ao *ao, uint32_t frames)
     return frames / (float) ao->samplerate * 1e6;
 }
 
-#if HAVE_COREAUDIO
 int64_t ca_get_latency(const AudioTimeStamp *ts)
 {
+#if HAVE_COREAUDIO
     uint64_t out = AudioConvertHostTimeToNanos(ts->mHostTime);
     uint64_t now = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime());
 
@@ -320,8 +322,22 @@ int64_t ca_get_latency(const AudioTimeStamp *ts)
         return 0;
 
     return (out - now) * 1e-3;
+#else
+    static mach_timebase_info_data_t timebase;
+    if (timebase.denom == 0)
+        mach_timebase_info(&timebase);
+
+    uint64_t out = ts->mHostTime;
+    uint64_t now = mach_absolute_time();
+
+    if (now > out)
+        return 0;
+
+    return (out - now) * timebase.numer / timebase.denom / 1e3;
+#endif
 }
 
+#if HAVE_COREAUDIO
 bool ca_stream_supports_compressed(struct ao *ao, AudioStreamID stream)
 {
     AudioStreamRangedDescription *formats = NULL;

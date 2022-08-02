@@ -3,18 +3,18 @@
  *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 /*
@@ -35,6 +35,7 @@
 #include <libbluray/overlay.h>
 #include <libbluray/keys.h>
 #include <libbluray/bluray-version.h>
+#include <libbluray/log_control.h>
 #include <libavutil/common.h>
 
 #include "config.h"
@@ -160,7 +161,7 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
     }
 }
 
-static int bluray_stream_fill_buffer(stream_t *s, char *buf, int len)
+static int bluray_stream_fill_buffer(stream_t *s, void *buf, int len)
 {
     struct bluray_priv_s *b = s->priv;
     BD_EVENT event;
@@ -282,9 +283,6 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         *(char**)arg = talloc_strdup(NULL, meta->di_name);
         return STREAM_OK;
     }
-    case STREAM_CTRL_GET_SIZE:
-        *(int64_t *)arg = bd_get_title_size(b->bd);
-        return STREAM_OK;
     default:
         break;
     }
@@ -388,6 +386,9 @@ static int bluray_stream_open_internal(stream_t *s)
         return STREAM_UNSUPPORTED;
     }
 
+    if (!mp_msg_test(s->log, MSGL_DEBUG))
+        bd_set_debug_mask(0);
+
     /* open device */
     BLURAY *bd = bd_open(device, NULL);
     if (!bd) {
@@ -414,7 +415,7 @@ static int bluray_stream_open_internal(stream_t *s)
             return STREAM_UNSUPPORTED;
         }
 
-        MP_VERBOSE(s, "List of available titles:\n");
+        MP_INFO(s, "List of available titles:\n");
 
         /* parse titles information */
         uint64_t max_duration = 0;
@@ -424,8 +425,8 @@ static int bluray_stream_open_internal(stream_t *s)
                 continue;
 
             char *time = mp_format_time(ti->duration / 90000, false);
-            MP_VERBOSE(s, "idx: %3d duration: %s (playlist: %05d.mpls)\n",
-                       i + 1, time, ti->playlist);
+            MP_INFO(s, "idx: %3d duration: %s (playlist: %05d.mpls)\n",
+                       i, time, ti->playlist);
             talloc_free(time);
 
             /* try to guess which title may contain the main movie */
@@ -450,8 +451,6 @@ static int bluray_stream_open_internal(stream_t *s)
     s->fill_buffer = bluray_stream_fill_buffer;
     s->close       = bluray_stream_close;
     s->control     = bluray_stream_control;
-    s->type        = STREAMTYPE_BLURAY;
-    s->sector_size = BLURAY_SECTOR_SIZE;
     s->priv        = b;
     s->demuxer     = "+disc";
 
@@ -513,12 +512,14 @@ const stream_info_t stream_info_bluray = {
     .name = "bd",
     .open = bluray_stream_open,
     .protocols = (const char*const[]){ "bd", "br", "bluray", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
 
 const stream_info_t stream_info_bdnav = {
     .name = "bdnav",
     .open = bluray_stream_open,
     .protocols = (const char*const[]){ "bdnav", "brnav", "bluraynav", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
 
 static bool check_bdmv(const char *path)
@@ -530,19 +531,16 @@ static bool check_bdmv(const char *path)
     if (!temp)
         return false;
 
-    bool r = false;
+    char data[50] = {0};
 
-    const char *sig1 = "MOBJ020";
-    const char *sig2 = "MOBJ0100";
-    char data[50];
-
-    if (fread(data, 50, 1, temp) == 1) {
-        r = memcmp(data, sig1, strlen(sig1)) == 0 ||
-            memcmp(data, sig2, strlen(sig2)) == 0;
-    }
-
+    fread(data, 50, 1, temp);
     fclose(temp);
-    return r;
+
+    bstr bdata = {data, 50};
+
+    return bstr_startswith0(bdata, "MOBJ0100") || // AVCHD
+           bstr_startswith0(bdata, "MOBJ0200") || // Blu-ray
+           bstr_startswith0(bdata, "MOBJ0300");   // UHD BD
 }
 
 // Destructively remove the current trailing path component.
@@ -609,4 +607,5 @@ const stream_info_t stream_info_bdmv_dir = {
     .name = "bdmv/bluray",
     .open = bdmv_dir_stream_open,
     .protocols = (const char*const[]){ "file", "", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };

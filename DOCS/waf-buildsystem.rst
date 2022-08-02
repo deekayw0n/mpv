@@ -46,7 +46,7 @@ mpv's custom configure step on top of waf
 
 To some extents mpv has a custom build system written on top of waf. This
 document will not go over the standard waf behaviour as that is documented in
-the `Waf book <http://docs.waf.googlecode.com/git/book_17/single.html>`_.
+the `Waf book <https://waf.io/book/>`_.
 
 All of the configuration process is handled with a declarative approach. Lists
 of dictionaries define the checks, and some custom Python code traverses these
@@ -146,7 +146,7 @@ mpv's custom build step on top of waf
 
 Build step is pretty much vanilla waf. The only difference being that the list
 of source files can contain both strings or tuples. If a tuple is found,
-the second element in the tuple will the used to match the features detected
+the second element in the tuple will be used to match the features detected
 in the configure step (the ``name`` field described above). If this feature
 was not enabled during configure, the source file will not be compiled in.
 

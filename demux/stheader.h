@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_STHEADER_H
@@ -22,7 +22,7 @@
 
 #include "common/common.h"
 #include "audio/chmap.h"
-#include "video/csputils.h"
+#include "video/mp_image.h"
 
 struct MPOpts;
 struct demuxer;
@@ -45,11 +45,18 @@ struct sh_stream {
     char *lang;                 // language code
     bool default_track;         // container default track flag
     bool forced_track;          // container forced track flag
+    bool dependent_track;       // container dependent track flag
+    bool visual_impaired_track; // container flag
+    bool hearing_impaired_track;// container flag
+    bool image;                 // video stream is an image
+    bool still_image;           // video stream contains still images
     int hls_bitrate;
 
     struct mp_tags *tags;
 
     bool missing_timestamps;
+
+    double seek_preroll;
 
     // stream is a picture (such as album art)
     struct demux_packet *attached_picture;
@@ -75,6 +82,11 @@ struct mp_codec_params {
 
     // Timestamp granularity for converting double<->rational timestamps.
     int native_tb_num, native_tb_den;
+
+    // Used by an obscure bug workaround mechanism. As an exception to the usual
+    // rules, demuxers are allowed to set this after adding the sh_stream, but
+    // only before the demuxer open call returns.
+    struct demux_packet *first_packet;
 
     // STREAM_AUDIO
     int samplerate;

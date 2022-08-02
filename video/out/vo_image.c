@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdio.h>
@@ -56,8 +56,8 @@ struct vo_image_opts {
 
 static const struct m_sub_options vo_image_conf = {
     .opts = (const struct m_option[]) {
-        OPT_SUBSTRUCT("vo-image", opts, image_writer_conf, 0),
-        OPT_STRING("vo-image-outdir", outdir, 0),
+        {"vo-image", OPT_SUBSTRUCT(opts, image_writer_conf)},
+        {"vo-image-outdir", OPT_STRING(outdir), .flags = M_OPT_FILE},
         {0},
     },
     .size = sizeof(struct vo_image_opts),
@@ -120,7 +120,7 @@ static void flip_page(struct vo *vo)
         filename = mp_path_join(t, p->opts->outdir, filename);
 
     MP_INFO(vo, "Saving %s\n", filename);
-    write_image(p->current, p->opts->opts, filename, vo->log);
+    write_image(p->current, p->opts->opts, filename, vo->global, vo->log);
 
     talloc_free(t);
     mp_image_unrefp(&p->current);

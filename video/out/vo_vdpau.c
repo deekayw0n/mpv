@@ -31,8 +31,6 @@
 #include <limits.h>
 #include <assert.h>
 
-#include <libavutil/common.h>
-
 #include "config.h"
 #include "video/vdpau.h"
 #include "video/vdpau_mixer.h"
@@ -86,10 +84,10 @@ struct vdpctx {
     int                                current_duration;
 
     int                                output_surface_w, output_surface_h;
+    int                                rotation;
 
     int                                force_yuv;
     struct mp_vdpau_mixer             *video_mixer;
-    int                                deint;
     int                                pullup;
     float                              denoise;
     float                              sharpen;
@@ -135,9 +133,6 @@ struct vdpctx {
         int render_count;
         int change_id;
     } osd_surfaces[MAX_OSD_PARTS];
-
-    // Video equalizer
-    struct mp_csp_equalizer video_eq;
 };
 
 static bool status_ok(struct vo *vo);
@@ -247,8 +242,7 @@ static void forget_frames(struct vo *vo, bool seek_reset)
 static int s_size(int max, int s, int disp)
 {
     disp = MPMAX(1, disp);
-    s += s / 2;
-    return MPMIN(max, s >= disp ? s : disp);
+    return MPMIN(max, MPMAX(s, disp));
 }
 
 static void resize(struct vo *vo)
@@ -288,7 +282,9 @@ static void resize(struct vo *vo)
                          1000LL * vc->flip_offset_window;
     vo_set_queue_params(vo, vc->flip_offset_us, 1);
 
-    if (vc->output_surface_w < vo->dwidth || vc->output_surface_h < vo->dheight) {
+    if (vc->output_surface_w < vo->dwidth || vc->output_surface_h < vo->dheight ||
+        vc->rotation != vo->params->rotate)
+    {
         vc->output_surface_w = s_size(max_w, vc->output_surface_w, vo->dwidth);
         vc->output_surface_h = s_size(max_h, vc->output_surface_h, vo->dheight);
         // Creation of output_surfaces
@@ -312,6 +308,7 @@ static void resize(struct vo *vo)
             vdp_st = vdp->output_surface_destroy(vc->rotation_surface);
             CHECK_VDP_WARNING(vo, "Error when calling "
                               "vdp_output_surface_destroy");
+            vc->rotation_surface = VDP_INVALID_HANDLE;
         }
         if (vo->params->rotate == 90 || vo->params->rotate == 270) {
             vdp_st = vdp->output_surface_create(vc->vdp_device,
@@ -330,6 +327,7 @@ static void resize(struct vo *vo)
         MP_DBG(vo, "vdpau rotation surface create: %u\n",
                vc->rotation_surface);
     }
+    vc->rotation = vo->params->rotate;
     vo->want_redraw = true;
 }
 
@@ -348,7 +346,7 @@ static int win_x11_init_vdpau_flip_queue(struct vo *vo)
                         "vdp_presentation_queue_target_create_x11");
     }
 
-    /* Emperically this seems to be the first call which fails when we
+    /* Empirically this seems to be the first call which fails when we
      * try to reinit after preemption while the user is still switched
      * from X to a virtual terminal (creating the vdp_device initially
      * succeeds, as does creating the flip_target above). This is
@@ -480,7 +478,17 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     VdpStatus vdp_st;
 
     if (!check_preemption(vo))
-        return -1;
+    {
+        /*
+         * When prempted, leave the reconfig() immediately
+         * without reconfiguring the vo_window and without
+         * initializing the vdpau objects. When recovered
+         * from preemption, if there is a difference between
+         * the VD thread parameters and the VO thread parameters
+         * the reconfig() is triggered again.
+         */
+        return 0;
+    }
 
     VdpChromaType chroma_type = VDP_CHROMA_TYPE_420;
     mp_vdpau_get_format(params->imgfmt, &chroma_type, NULL);
@@ -588,7 +596,7 @@ static void generate_osd_part(struct vo *vo, struct sub_bitmaps *imgs)
     case SUBBITMAP_LIBASS:
         format = VDP_RGBA_FORMAT_A8;
         break;
-    case SUBBITMAP_RGBA:
+    case SUBBITMAP_BGRA:
         format = VDP_RGBA_FORMAT_B8G8R8A8;
         break;
     default:
@@ -679,7 +687,7 @@ static void draw_osd(struct vo *vo)
 
     bool formats[SUBBITMAP_COUNT] = {
         [SUBBITMAP_LIBASS] = vc->supports_a8,
-        [SUBBITMAP_RGBA] = true,
+        [SUBBITMAP_BGRA] = true,
     };
 
     double pts = vc->current_image ? vc->current_image->pts : 0;
@@ -809,7 +817,7 @@ static void flip_page(struct vo *vo)
      * not make the target time in reality. Without this check we could drop
      * every frame, freezing the display completely if video lags behind.
      */
-    if (now > PREV_VSYNC(FFMAX(pts, vc->last_queue_time + vc->vsync_interval)))
+    if (now > PREV_VSYNC(MPMAX(pts, vc->last_queue_time + vc->vsync_interval)))
         npts = UINT64_MAX;
 
     /* Allow flipping a frame at a vsync if its presentation time is a
@@ -836,15 +844,15 @@ static void flip_page(struct vo *vo)
 
     vc->dropped_time = ideal_pts;
 
-    pts = FFMAX(pts, vc->last_queue_time + vc->vsync_interval);
-    pts = FFMAX(pts, now);
+    pts = MPMAX(pts, vc->last_queue_time + vc->vsync_interval);
+    pts = MPMAX(pts, now);
     if (npts < PREV_VSYNC(pts) + vc->vsync_interval)
         goto drop;
 
     int num_flips = update_presentation_queue_status(vo);
     vsync = vc->recent_vsync_time + num_flips * vc->vsync_interval;
-    pts = FFMAX(pts, now);
-    pts = FFMAX(pts, vsync + (vc->vsync_interval >> 2));
+    pts = MPMAX(pts, now);
+    pts = MPMAX(pts, vsync + (vc->vsync_interval >> 2));
     vsync = PREV_VSYNC(pts);
     if (npts < vsync + vc->vsync_interval)
         goto drop;
@@ -1026,10 +1034,11 @@ static int preinit(struct vo *vo)
     hwdec_devices_add(vo->hwdec_devs, &vc->mpvdp->hwctx);
 
     vc->video_mixer = mp_vdpau_mixer_create(vc->mpvdp, vo->log);
+    vc->video_mixer->video_eq = mp_csp_equalizer_create(vo, vo->global);
 
     if (mp_vdpau_guess_if_emulated(vc->mpvdp)) {
         MP_WARN(vo, "VDPAU is most likely emulated via VA-API.\n"
-                    "This is inefficient. Use --vo=opengl instead.\n");
+                    "This is inefficient. Use --vo=gpu instead.\n");
     }
 
     // Mark everything as invalid first so uninit() can tell what has been
@@ -1044,33 +1053,12 @@ static int preinit(struct vo *vo)
     vc->vdp->bitmap_surface_query_capabilities(vc->vdp_device, VDP_RGBA_FORMAT_A8,
                             &vc->supports_a8, &(uint32_t){0}, &(uint32_t){0});
 
-    vc->video_eq.capabilities = MP_CSP_EQ_CAPS_COLORMATRIX;
+    MP_WARN(vo, "Warning: this compatibility VO is low quality and may "
+                "have issues with OSD, scaling, screenshots and more.\n"
+                "vo=gpu is the preferred choice in any case and "
+                "includes VDPAU support via hwdec=vdpau or vdpau-copy.\n");
 
     return 0;
-}
-
-static int get_equalizer(struct vo *vo, const char *name, int *value)
-{
-    struct vdpctx *vc = vo->priv;
-
-    if (vc->rgb_mode)
-        return false;
-
-    return mp_csp_equalizer_get(&vc->video_mixer->video_eq, name, value) >= 0 ?
-           VO_TRUE : VO_NOTIMPL;
-}
-
-static int set_equalizer(struct vo *vo, const char *name, int value)
-{
-    struct vdpctx *vc = vo->priv;
-
-    if (vc->rgb_mode)
-        return false;
-
-    if (mp_csp_equalizer_set(&vc->video_mixer->video_eq, name, value) < 0)
-        return VO_NOTIMPL;
-    vc->video_mixer->initialized = false;
-    return true;
 }
 
 static void checked_resize(struct vo *vo)
@@ -1082,23 +1070,15 @@ static void checked_resize(struct vo *vo)
 
 static int control(struct vo *vo, uint32_t request, void *data)
 {
-    struct vdpctx *vc = vo->priv;
-
     check_preemption(vo);
 
     switch (request) {
     case VOCTRL_SET_PANSCAN:
         checked_resize(vo);
         return VO_TRUE;
-    case VOCTRL_SET_EQUALIZER: {
+    case VOCTRL_SET_EQUALIZER:
         vo->want_redraw = true;
-        struct voctrl_set_equalizer_args *args = data;
-        return set_equalizer(vo, args->name, args->value);
-    }
-    case VOCTRL_GET_EQUALIZER: {
-        struct voctrl_get_equalizer_args *args = data;
-        return get_equalizer(vo, args->name, args->valueptr);
-    }
+        return true;
     case VOCTRL_RESET:
         forget_frames(vo, true);
         return true;
@@ -1106,9 +1086,6 @@ static int control(struct vo *vo, uint32_t request, void *data)
         if (!status_ok(vo))
             return false;
         *(struct mp_image **)data = get_window_screenshot(vo);
-        return true;
-    case VOCTRL_GET_PREF_DEINT:
-        *(int *)data = vc->deint;
         return true;
     }
 
@@ -1142,26 +1119,23 @@ const struct vo_driver video_out_vdpau = {
     .uninit = uninit,
     .priv_size = sizeof(struct vdpctx),
     .options = (const struct m_option []){
-        OPT_INTRANGE("deint", deint, 0, -4, 4),
-        OPT_FLAG("chroma-deint", chroma_deint, 0, OPTDEF_INT(1)),
-        OPT_FLAG("pullup", pullup, 0),
-        OPT_FLOATRANGE("denoise", denoise, 0, 0, 1),
-        OPT_FLOATRANGE("sharpen", sharpen, 0, -1, 1),
-        OPT_INTRANGE("hqscaling", hqscaling, 0, 0, 9),
-        OPT_FLOAT("fps", user_fps, 0),
-        OPT_FLAG("composite-detect", composite_detect, 0, OPTDEF_INT(1)),
-        OPT_INT("queuetime-windowed", flip_offset_window, 0, OPTDEF_INT(50)),
-        OPT_INT("queuetime-fs", flip_offset_fs, 0, OPTDEF_INT(50)),
-        OPT_INTRANGE("output-surfaces", num_output_surfaces, 0,
-                     2, MAX_OUTPUT_SURFACES, OPTDEF_INT(3)),
-        OPT_COLOR("colorkey", colorkey, 0,
-                  .defval = &(const struct m_color) {
-                      .r = 2, .g = 5, .b = 7, .a = 255,
-                  }),
-        OPT_FLAG("force-yuv", force_yuv, 0),
-        OPT_REPLACED("queuetime_windowed", "queuetime-windowed"),
-        OPT_REPLACED("queuetime_fs", "queuetime-fs"),
-        OPT_REPLACED("output_surfaces", "output-surfaces"),
+        {"chroma-deint", OPT_FLAG(chroma_deint), OPTDEF_INT(1)},
+        {"pullup", OPT_FLAG(pullup)},
+        {"denoise", OPT_FLOAT(denoise), M_RANGE(0, 1)},
+        {"sharpen", OPT_FLOAT(sharpen), M_RANGE(-1, 1)},
+        {"hqscaling", OPT_INT(hqscaling), M_RANGE(0, 9)},
+        {"fps", OPT_FLOAT(user_fps)},
+        {"composite-detect", OPT_FLAG(composite_detect), OPTDEF_INT(1)},
+        {"queuetime-windowed", OPT_INT(flip_offset_window), OPTDEF_INT(50)},
+        {"queuetime-fs", OPT_INT(flip_offset_fs), OPTDEF_INT(50)},
+        {"output-surfaces", OPT_INT(num_output_surfaces),
+            M_RANGE(2, MAX_OUTPUT_SURFACES), OPTDEF_INT(3)},
+        {"colorkey", OPT_COLOR(colorkey),
+            .defval = &(const struct m_color){.r = 2, .g = 5, .b = 7, .a = 255}},
+        {"force-yuv", OPT_FLAG(force_yuv)},
+        {"queuetime_windowed", OPT_REPLACED("queuetime-windowed")},
+        {"queuetime_fs", OPT_REPLACED("queuetime-fs")},
+        {"output_surfaces", OPT_REPLACED("output-surfaces")},
         {NULL},
     },
     .options_prefix = "vo-vdpau",

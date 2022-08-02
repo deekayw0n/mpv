@@ -18,40 +18,40 @@
 #include <assert.h>
 
 #include <X11/Xlib.h>
+#include <X11/extensions/Xpresent.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 
-#ifndef EGL_VERSION_1_5
-#define EGL_CONTEXT_OPENGL_PROFILE_MASK         0x30FD
-#define EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT     0x00000001
-#endif
-
 #include "common/common.h"
+#include "video/out/present_sync.h"
 #include "video/out/x11_common.h"
 #include "context.h"
 #include "egl_helpers.h"
+#include "utils.h"
+
+#define EGL_PLATFORM_X11_EXT 0x31D5
 
 struct priv {
+    GL gl;
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
 };
 
-static void mpegl_uninit(MPGLContext *ctx)
+static void mpegl_uninit(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    if (p->egl_context) {
-        eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                       EGL_NO_CONTEXT);
-        eglDestroyContext(p->egl_display, p->egl_context);
-    }
-    p->egl_context = EGL_NO_CONTEXT;
+    ra_gl_ctx_uninit(ctx);
+
+    eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
+    eglTerminate(p->egl_display);
     vo_x11_uninit(ctx->vo);
 }
 
 static int pick_xrgba_config(void *user_data, EGLConfig *configs, int num_configs)
 {
-    struct MPGLContext *ctx = user_data;
+    struct ra_ctx *ctx = user_data;
     struct priv *p = ctx->priv;
     struct vo *vo = ctx->vo;
 
@@ -72,40 +72,70 @@ static int pick_xrgba_config(void *user_data, EGLConfig *configs, int num_config
     return 0;
 }
 
-static int mpegl_init(struct MPGLContext *ctx, int flags)
+static bool mpegl_check_visible(struct ra_ctx *ctx)
+{
+    return vo_x11_check_visible(ctx->vo);
+}
+
+static void mpegl_swap_buffers(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
+
+    eglSwapBuffers(p->egl_display, p->egl_surface);
+    if (ctx->vo->x11->use_present) {
+        vo_x11_present(ctx->vo);
+        present_sync_swap(ctx->vo->x11->present);
+    }
+}
+
+static void mpegl_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
+{
+    struct vo_x11_state *x11 = ctx->vo->x11;
+    if (ctx->vo->x11->use_present)
+        present_sync_get_info(x11->present, info);
+}
+
+static bool mpegl_init(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
     struct vo *vo = ctx->vo;
-    int msgl = vo->probing ? MSGL_V : MSGL_FATAL;
+    int msgl = ctx->opts.probing ? MSGL_V : MSGL_FATAL;
 
     if (!vo_x11_init(vo))
         goto uninit;
 
-    p->egl_display = eglGetDisplay(vo->x11->display);
+    p->egl_display = mpegl_get_display(EGL_PLATFORM_X11_EXT,
+                                       "EGL_EXT_platform_x11",
+                                        vo->x11->display);
     if (!eglInitialize(p->egl_display, NULL, NULL)) {
-        mp_msg(vo->log, msgl, "Could not initialize EGL.\n");
+        MP_MSG(ctx, msgl, "Could not initialize EGL.\n");
         goto uninit;
     }
 
-    struct mpegl_opts opts = {
-        .vo_flags = flags,
+    struct mpegl_cb cb = {
         .user_data = ctx,
-        .refine_config = (flags & VOFLAG_ALPHA) ? pick_xrgba_config : NULL,
+        .refine_config = ctx->opts.want_alpha ? pick_xrgba_config : NULL,
     };
 
     EGLConfig config;
-    if (!mpegl_create_context_opts(p->egl_display, vo->log, &opts,
-                                   &p->egl_context, &config))
+    if (!mpegl_create_context_cb(ctx, p->egl_display, cb, &p->egl_context, &config))
         goto uninit;
 
-    int vID, n;
-    eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID, &vID);
-    MP_VERBOSE(vo, "chose visual 0x%x\n", vID);
+    int cid, vID, n;
+    if (!eglGetConfigAttrib(p->egl_display, config, EGL_CONFIG_ID, &cid)) {
+        MP_FATAL(ctx, "Getting EGL_CONFIG_ID failed!\n");
+        goto uninit;
+    }
+    if (!eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID, &vID)) {
+        MP_FATAL(ctx, "Getting X visual ID failed!\n");
+        goto uninit;
+    }
+    MP_VERBOSE(ctx, "Choosing visual EGL config 0x%x, visual ID 0x%x\n", cid, vID);
     XVisualInfo template = {.visualid = vID};
     XVisualInfo *vi = XGetVisualInfo(vo->x11->display, VisualIDMask, &template, &n);
 
     if (!vi) {
-        MP_FATAL(vo, "Getting X visual failed!\n");
+        MP_FATAL(ctx, "Getting X visual failed!\n");
         goto uninit;
     }
 
@@ -116,71 +146,82 @@ static int mpegl_init(struct MPGLContext *ctx, int flags)
 
     XFree(vi);
 
-    p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
-                                    (EGLNativeWindowType)vo->x11->window, NULL);
-
+    p->egl_surface = mpegl_create_window_surface(
+        p->egl_display, config, &vo->x11->window);
     if (p->egl_surface == EGL_NO_SURFACE) {
-        MP_FATAL(ctx->vo, "Could not create EGL surface!\n");
+        p->egl_surface = eglCreateWindowSurface(
+            p->egl_display, config, (EGLNativeWindowType)vo->x11->window, NULL);
+    }
+    if (p->egl_surface == EGL_NO_SURFACE) {
+        MP_FATAL(ctx, "Could not create EGL surface!\n");
         goto uninit;
     }
 
     if (!eglMakeCurrent(p->egl_display, p->egl_surface, p->egl_surface,
                         p->egl_context))
     {
-        MP_FATAL(ctx->vo, "Could not make context current!\n");
+        MP_FATAL(ctx, "Could not make context current!\n");
         goto uninit;
     }
 
-    const char *egl_exts = eglQueryString(p->egl_display, EGL_EXTENSIONS);
+    mpegl_load_functions(&p->gl, ctx->log);
 
-    void *(*gpa)(const GLubyte*) = (void *(*)(const GLubyte*))eglGetProcAddress;
-    mpgl_load_functions(ctx->gl, gpa, egl_exts, vo->log);
+    struct ra_gl_ctx_params params = {
+        .check_visible = mpegl_check_visible,
+        .swap_buffers = mpegl_swap_buffers,
+        .get_vsync    = mpegl_get_vsync,
+    };
 
-    ctx->native_display_type = "x11";
-    ctx->native_display = vo->x11->display;
-    return 0;
+    if (!ra_gl_ctx_init(ctx, &p->gl, params))
+        goto uninit;
+
+    ra_add_native_resource(ctx->ra, "x11", vo->x11->display);
+
+    return true;
 
 uninit:
     mpegl_uninit(ctx);
-    return -1;
+    return false;
 }
 
-static int mpegl_reconfig(struct MPGLContext *ctx)
+static void resize(struct ra_ctx *ctx)
+{
+    ra_gl_ctx_resize(ctx->swapchain, ctx->vo->dwidth, ctx->vo->dheight, 0);
+}
+
+static bool mpegl_reconfig(struct ra_ctx *ctx)
 {
     vo_x11_config_vo_window(ctx->vo);
-    return 0;
+    resize(ctx);
+    return true;
 }
 
-static int mpegl_control(struct MPGLContext *ctx, int *events, int request,
+static int mpegl_control(struct ra_ctx *ctx, int *events, int request,
                          void *arg)
 {
-    return vo_x11_control(ctx->vo, events, request, arg);
+    int ret = vo_x11_control(ctx->vo, events, request, arg);
+    if (*events & VO_EVENT_RESIZE)
+        resize(ctx);
+    return ret;
 }
 
-static void mpegl_swap_buffers(MPGLContext *ctx)
-{
-    struct priv *p = ctx->priv;
-    eglSwapBuffers(p->egl_display, p->egl_surface);
-}
-
-static void mpegl_wakeup(struct MPGLContext *ctx)
+static void mpegl_wakeup(struct ra_ctx *ctx)
 {
     vo_x11_wakeup(ctx->vo);
 }
 
-static void mpegl_wait_events(struct MPGLContext *ctx, int64_t until_time_us)
+static void mpegl_wait_events(struct ra_ctx *ctx, int64_t until_time_us)
 {
     vo_x11_wait_events(ctx->vo, until_time_us);
 }
 
-const struct mpgl_driver mpgl_driver_x11egl = {
+const struct ra_ctx_fns ra_ctx_x11_egl = {
+    .type           = "opengl",
     .name           = "x11egl",
-    .priv_size      = sizeof(struct priv),
-    .init           = mpegl_init,
     .reconfig       = mpegl_reconfig,
-    .swap_buffers   = mpegl_swap_buffers,
     .control        = mpegl_control,
     .wakeup         = mpegl_wakeup,
     .wait_events    = mpegl_wait_events,
+    .init           = mpegl_init,
     .uninit         = mpegl_uninit,
 };

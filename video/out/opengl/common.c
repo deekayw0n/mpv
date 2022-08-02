@@ -31,6 +31,7 @@
 
 #include "common.h"
 #include "common/common.h"
+#include "utils.h"
 
 // This guesses if the current GL context is a suspected software renderer.
 static bool is_software_gl(GL *gl)
@@ -40,21 +41,15 @@ static bool is_software_gl(GL *gl)
     return !(renderer && vendor) ||
            strcmp(renderer, "Software Rasterizer") == 0 ||
            strstr(renderer, "llvmpipe") ||
+           strstr(renderer, "softpipe") ||
            strcmp(vendor, "Microsoft Corporation") == 0 ||
-           strcmp(renderer, "Mesa X11") == 0;
+           strcmp(renderer, "Mesa X11") == 0 ||
+           strcmp(renderer, "Apple Software Renderer") == 0;
 }
 
 static void GLAPIENTRY dummy_glBindFramebuffer(GLenum target, GLuint framebuffer)
 {
     assert(framebuffer == 0);
-}
-
-static bool check_ext(GL *gl, const char *name)
-{
-    const char *exts = gl->extensions;
-    char *s = strstr(exts, name);
-    char *e = s ? s + strlen(name) : NULL;
-    return s && (s == exts || s[-1] == ' ') && (e[0] == ' ' || !e[0]);
 }
 
 #define FN_OFFS(name) offsetof(GL, name)
@@ -95,6 +90,7 @@ static const struct gl_functions gl_functions[] = {
             DEF_FN(BindTexture),
             DEF_FN(BlendFuncSeparate),
             DEF_FN(BufferData),
+            DEF_FN(BufferSubData),
             DEF_FN(Clear),
             DEF_FN(ClearColor),
             DEF_FN(CompileShader),
@@ -147,6 +143,7 @@ static const struct gl_functions gl_functions[] = {
         .ver_core = 210,
         .provides = MPGL_CAP_ROW_LENGTH | MPGL_CAP_1D_TEX,
         .functions = (const struct gl_function[]) {
+            DEF_FN(DrawBuffer),
             DEF_FN(GetTexLevelParameteriv),
             DEF_FN(ReadBuffer),
             DEF_FN(TexImage1D),
@@ -267,6 +264,7 @@ static const struct gl_functions gl_functions[] = {
     },
     {
         .ver_core = 320,
+        .ver_es_core = 300,
         .extension = "GL_ARB_sync",
         .functions = (const struct gl_function[]) {
             DEF_FN(FenceSync),
@@ -310,11 +308,81 @@ static const struct gl_functions gl_functions[] = {
     },
     {
         .ver_core = 430,
+        .extension = "GL_ARB_invalidate_subdata",
+        .functions = (const struct gl_function[]) {
+            DEF_FN(InvalidateTexImage),
+            {0}
+        },
+    },
+    {
+        .ver_core = 430,
         .ver_es_core = 300,
         .functions = (const struct gl_function[]) {
             DEF_FN(InvalidateFramebuffer),
             {0}
         },
+    },
+    {
+        .ver_core = 410,
+        .ver_es_core = 300,
+        .extension = "GL_ARB_get_program_binary",
+        .functions = (const struct gl_function[]) {
+            DEF_FN(GetProgramBinary),
+            DEF_FN(ProgramBinary),
+            {0}
+        },
+    },
+    {
+        .ver_core = 440,
+        .extension = "GL_ARB_buffer_storage",
+        .functions = (const struct gl_function[]) {
+            DEF_FN(BufferStorage),
+            {0}
+        },
+    },
+    // Equivalent extension for ES
+    {
+        .extension = "GL_EXT_buffer_storage",
+        .functions = (const struct gl_function[]) {
+            DEF_FN_NAME(BufferStorage, "glBufferStorageEXT"),
+            {0}
+        },
+    },
+    {
+        .ver_core = 420,
+        .ver_es_core = 310,
+        .extension = "GL_ARB_shader_image_load_store",
+        .functions = (const struct gl_function[]) {
+            DEF_FN(BindImageTexture),
+            DEF_FN(MemoryBarrier),
+            {0}
+        },
+    },
+    {
+        .ver_core = 310,
+        .ver_es_core = 300,
+        .extension = "GL_ARB_uniform_buffer_object",
+        .provides = MPGL_CAP_UBO,
+    },
+    {
+        .ver_core = 430,
+        .ver_es_core = 310,
+        .extension = "GL_ARB_shader_storage_buffer_object",
+        .provides = MPGL_CAP_SSBO,
+    },
+    {
+        .ver_core = 430,
+        .ver_es_core = 310,
+        .extension = "GL_ARB_compute_shader",
+        .functions = (const struct gl_function[]) {
+            DEF_FN(DispatchCompute),
+            {0},
+        },
+    },
+    {
+        .ver_core = 430,
+        .extension = "GL_ARB_arrays_of_arrays",
+        .provides = MPGL_CAP_NESTED_ARRAY,
     },
     // Swap control, always an OS specific extension
     // The OSX code loads this manually.
@@ -322,6 +390,15 @@ static const struct gl_functions gl_functions[] = {
         .extension = "GLX_SGI_swap_control",
         .functions = (const struct gl_function[]) {
             DEF_FN_NAME(SwapInterval, "glXSwapIntervalSGI"),
+            {0},
+        },
+    },
+    // This one overrides GLX_SGI_swap_control on platforms using mesa. The
+    // only difference is that it supports glXSwapInterval(0).
+    {
+        .extension = "GLX_MESA_swap_control",
+        .functions = (const struct gl_function[]) {
+            DEF_FN_NAME(SwapInterval, "glXSwapIntervalMESA"),
             {0},
         },
     },
@@ -391,20 +468,14 @@ static const struct gl_functions gl_functions[] = {
             {0}
         },
     },
-    // These don't exist - they are for the sake of mpv internals, and libmpv
-    // interaction (see libmpv/opengl_cb.h).
+    // ES version uses a different extension.
     {
-        .extension = "GL_MP_MPGetNativeDisplay",
+        .ver_es_core = 320,
+        .extension = "GL_KHR_debug",
+        .provides = MPGL_CAP_DEBUG,
         .functions = (const struct gl_function[]) {
-            DEF_FN(MPGetNativeDisplay),
-            {0}
-        },
-    },
-    // Same, but using the old name.
-    {
-        .extension = "GL_MP_D3D_interfaces",
-        .functions = (const struct gl_function[]) {
-            DEF_FN_NAME(MPGetNativeDisplay, "glMPGetD3DInterface"),
+            // (only functions needed by us)
+            DEF_FN(DebugMessageCallback),
             {0}
         },
     },
@@ -422,7 +493,6 @@ static const struct gl_functions gl_functions[] = {
 #undef DEF_FN
 #undef DEF_FN_NAME
 
-
 // Fill the GL struct with function pointers and extensions from the current
 // GL context. Called by the backend.
 // get_fn: function to resolve function names
@@ -431,7 +501,7 @@ static const struct gl_functions gl_functions[] = {
 void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
                           void *fn_ctx, const char *ext2, struct mp_log *log)
 {
-    talloc_free_children(gl);
+    talloc_free(gl->extensions);
     *gl = (GL) {
         .extensions = talloc_strdup(gl, ext2 ? ext2 : ""),
     };
@@ -514,8 +584,8 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
         if (ver_core)
             must_exist = version >= ver_core;
 
-        if (section->extension && check_ext(gl, section->extension))
-            exists = true;
+        if (section->extension)
+            exists = gl_check_extension(gl->extensions, section->extension);
 
         exists |= must_exist;
         if (!exists)
@@ -563,20 +633,24 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
         if (gl->es >= 200)
             gl->glsl_version = 100;
         if (gl->es >= 300)
-            gl->glsl_version = 300;
+            gl->glsl_version = gl->es;
     } else {
-        gl->glsl_version = 110;
+        gl->glsl_version = 120;
         int glsl_major = 0, glsl_minor = 0;
         if (shader && sscanf(shader, "%d.%d", &glsl_major, &glsl_minor) == 2)
             gl->glsl_version = glsl_major * 100 + glsl_minor;
-        // GLSL 400 defines "sample" as keyword - breaks custom shaders.
-        gl->glsl_version = MPMIN(gl->glsl_version, 330);
+        // restrict GLSL version to be forwards compatible
+        gl->glsl_version = MPMIN(gl->glsl_version, 440);
     }
 
     if (is_software_gl(gl)) {
         gl->mpgl_caps |= MPGL_CAP_SW;
         mp_verbose(log, "Detected suspected software renderer.\n");
     }
+
+    // GL_ARB_compute_shader & GL_ARB_shader_image_load_store
+    if (gl->DispatchCompute && gl->BindImageTexture)
+        gl->mpgl_caps |= MPGL_CAP_COMPUTE_SHADER;
 
     // Provided for simpler handling if no framebuffer support is available.
     if (!gl->BindFramebuffer)

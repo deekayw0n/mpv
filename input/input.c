@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "config.h"
@@ -31,16 +31,11 @@
 #include <pthread.h>
 #include <assert.h>
 
-#include <libavutil/avstring.h>
-#include <libavutil/common.h>
-
 #include "osdep/io.h"
 #include "misc/rendezvous.h"
 
 #include "input.h"
 #include "keycodes.h"
-#include "cmd_list.h"
-#include "cmd_parse.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 #include "common/msg.h"
@@ -51,6 +46,7 @@
 #include "mpv_talloc.h"
 #include "options/options.h"
 #include "misc/bstr.h"
+#include "misc/node.h"
 #include "stream/stream.h"
 #include "common/common.h"
 
@@ -68,6 +64,7 @@ struct cmd_bind {
     int num_keys;
     char *cmd;
     char *location;     // filename/line number of definition
+    char *desc;         // human readable description
     bool is_builtin;
     struct cmd_bind_section *owner;
 };
@@ -79,7 +76,6 @@ struct cmd_bind_section {
     char *section;
     struct mp_rect mouse_area;  // set at runtime, if at all
     bool mouse_area_set;        // mouse_area is valid and should be tested
-    struct cmd_bind_section *next;
 };
 
 #define MP_MAX_SOURCES 10
@@ -93,6 +89,11 @@ struct active_section {
 
 struct cmd_queue {
     struct mp_cmd *first;
+};
+
+struct wheel_state {
+    double dead_zone_accum;
+    double unit_accum;
 };
 
 struct input_ctx {
@@ -121,6 +122,7 @@ struct input_ctx {
 
     // Mouse position on the consumer side (as command.c sees it)
     int mouse_x, mouse_y;
+    int mouse_hover;  // updated on mouse-enter/leave
     char *mouse_section; // last section to receive mouse event
 
     // Mouse position on the producer side (as the VO sees it)
@@ -130,8 +132,15 @@ struct input_ctx {
     bool mouse_mangle, mouse_src_mangle;
     struct mp_rect mouse_src, mouse_dst;
 
+    // Wheel state (MP_WHEEL_*)
+    struct wheel_state wheel_state_y; // MP_WHEEL_UP/MP_WHEEL_DOWN
+    struct wheel_state wheel_state_x; // MP_WHEEL_LEFT/MP_WHEEL_RIGHT
+    struct wheel_state *wheel_current; // The direction currently being scrolled
+    double last_wheel_time; // mp_time_sec() of the last wheel event
+
     // List of command binding sections
-    struct cmd_bind_section *cmd_bind_sections;
+    struct cmd_bind_section **sections;
+    int num_sections;
 
     // List currently active command sections
     struct active_section active_sections[MAX_ACTIVE_SECTIONS];
@@ -143,8 +152,6 @@ struct input_ctx {
     int num_sources;
 
     struct cmd_queue cmd_queue;
-
-    struct mp_cancel *cancel;
 
     void (*wakeup_cb)(void *ctx);
     void *wakeup_ctx;
@@ -166,9 +173,10 @@ struct input_opts {
     int ar_rate;
     int use_alt_gr;
     int use_appleremote;
+    int use_gamepad;
     int use_media_keys;
-    int use_app_events;
     int default_bindings;
+    int builtin_bindings;
     int enable_mouse_movements;
     int vo_key_input;
     int test;
@@ -177,25 +185,29 @@ struct input_opts {
 
 const struct m_sub_options input_config = {
     .opts = (const m_option_t[]) {
-        OPT_STRING("input-conf", config_file, M_OPT_FIXED | M_OPT_FILE),
-        OPT_INT("input-ar-delay", ar_delay, 0),
-        OPT_INT("input-ar-rate", ar_rate, 0),
-        OPT_PRINT("input-keylist", mp_print_key_list),
-        OPT_PRINT("input-cmdlist", mp_print_cmd_list),
-        OPT_FLAG("input-default-bindings", default_bindings, 0),
-        OPT_FLAG("input-test", test, 0),
-        OPT_INTRANGE("input-doubleclick-time", doubleclick_time, 0, 0, 1000),
-        OPT_FLAG("input-right-alt-gr", use_alt_gr, 0),
-        OPT_INTRANGE("input-key-fifo-size", key_fifo_size, 0, 2, 65000),
-        OPT_FLAG("input-cursor", enable_mouse_movements, 0),
-        OPT_FLAG("input-vo-keyboard", vo_key_input, 0),
-#if HAVE_COCOA
-        OPT_FLAG("input-appleremote", use_appleremote, 0),
-        OPT_FLAG("input-media-keys", use_media_keys, 0),
-        OPT_FLAG("input-app-events", use_app_events, M_OPT_FIXED),
+        {"input-conf", OPT_STRING(config_file), .flags = M_OPT_FILE},
+        {"input-ar-delay", OPT_INT(ar_delay)},
+        {"input-ar-rate", OPT_INT(ar_rate)},
+        {"input-keylist", OPT_PRINT(mp_print_key_list)},
+        {"input-cmdlist", OPT_PRINT(mp_print_cmd_list)},
+        {"input-default-bindings", OPT_FLAG(default_bindings)},
+        {"input-builtin-bindings", OPT_FLAG(builtin_bindings)},
+        {"input-test", OPT_FLAG(test)},
+        {"input-doubleclick-time", OPT_INT(doubleclick_time),
+         M_RANGE(0, 1000)},
+        {"input-right-alt-gr", OPT_FLAG(use_alt_gr)},
+        {"input-key-fifo-size", OPT_INT(key_fifo_size), M_RANGE(2, 65000)},
+        {"input-cursor", OPT_FLAG(enable_mouse_movements)},
+        {"input-vo-keyboard", OPT_FLAG(vo_key_input)},
+        {"input-media-keys", OPT_FLAG(use_media_keys)},
+#if HAVE_SDL2_GAMEPAD
+        {"input-gamepad", OPT_FLAG(use_gamepad)},
 #endif
-        OPT_FLAG("window-dragging", allow_win_drag, 0),
-        OPT_REPLACED("input-x11-keyboard", "input-vo-keyboard"),
+        {"window-dragging", OPT_FLAG(allow_win_drag)},
+        {"input-x11-keyboard", OPT_REPLACED("input-vo-keyboard")},
+#if HAVE_COCOA
+        {"input-appleremote", OPT_REMOVED("replaced by MediaPlayer support")},
+#endif
         {0}
     },
     .size = sizeof(struct input_opts),
@@ -206,12 +218,9 @@ const struct m_sub_options input_config = {
         .ar_rate = 40,
         .use_alt_gr = 1,
         .enable_mouse_movements = 1,
-#if HAVE_COCOA
-        .use_appleremote = 1,
         .use_media_keys = 1,
-        .use_app_events = 1,
-#endif
         .default_bindings = 1,
+        .builtin_bindings = 1,
         .vo_key_input = 1,
         .allow_win_drag = 1,
     },
@@ -219,7 +228,7 @@ const struct m_sub_options input_config = {
 };
 
 static const char builtin_input_conf[] =
-#include "input/input_conf.h"
+#include "generated/etc/input.conf.inc"
 ;
 
 static bool test_rect(struct mp_rect *rc, int x, int y)
@@ -277,8 +286,8 @@ static void append_bind_info(struct input_ctx *ictx, char **pmsg,
     char *msg = *pmsg;
     struct mp_cmd *cmd = mp_input_parse_cmd(ictx, bstr0(bind->cmd),
                                             bind->location);
-    bstr stripped = cmd ? cmd->original : bstr0(bind->cmd);
-    msg = talloc_asprintf_append(msg, " '%.*s'", BSTR_P(stripped));
+    char *stripped = cmd ? cmd->original : bind->cmd;
+    msg = talloc_asprintf_append(msg, " '%s'", stripped);
     if (!cmd)
         msg = talloc_asprintf_append(msg, " (invalid)");
     if (strcmp(bind->owner->section, "default") != 0)
@@ -307,9 +316,9 @@ static mp_cmd_t *handle_test(struct input_ctx *ictx, int code)
     talloc_free(key_buf);
 
     int count = 0;
-    for (struct cmd_bind_section *bs = ictx->cmd_bind_sections;
-         bs; bs = bs->next)
-    {
+    for (int n = 0; n < ictx->num_sections; n++) {
+        struct cmd_bind_section *bs = ictx->sections[n];
+
         for (int i = 0; i < bs->num_binds; i++) {
             if (bs->binds[i].num_keys && bs->binds[i].keys[0] == code) {
                 count++;
@@ -331,32 +340,32 @@ static mp_cmd_t *handle_test(struct input_ctx *ictx, int code)
     return res;
 }
 
+static struct cmd_bind_section *find_section(struct input_ctx *ictx,
+                                             bstr section)
+{
+    for (int n = 0; n < ictx->num_sections; n++) {
+        struct cmd_bind_section *bs = ictx->sections[n];
+        if (bstr_equals0(section, bs->section))
+            return bs;
+    }
+    return NULL;
+}
+
 static struct cmd_bind_section *get_bind_section(struct input_ctx *ictx,
                                                  bstr section)
 {
-    struct cmd_bind_section *bind_section = ictx->cmd_bind_sections;
-
     if (section.len == 0)
         section = bstr0("default");
-    while (bind_section) {
-        if (bstrcmp0(section, bind_section->section) == 0)
-            return bind_section;
-        if (bind_section->next == NULL)
-            break;
-        bind_section = bind_section->next;
-    }
-    if (bind_section) {
-        bind_section->next = talloc_ptrtype(ictx, bind_section->next);
-        bind_section = bind_section->next;
-    } else {
-        ictx->cmd_bind_sections = talloc_ptrtype(ictx, ictx->cmd_bind_sections);
-        bind_section = ictx->cmd_bind_sections;
-    }
+    struct cmd_bind_section *bind_section = find_section(ictx, section);
+    if (bind_section)
+        return bind_section;
+    bind_section = talloc_ptrtype(ictx, bind_section);
     *bind_section = (struct cmd_bind_section) {
         .section = bstrdup0(bind_section, section),
         .mouse_area = {INT_MIN, INT_MIN, INT_MAX, INT_MAX},
         .mouse_area_set = true,
     };
+    MP_TARRAY_APPEND(ictx, ictx->sections, ictx->num_sections, bind_section);
     return bind_section;
 }
 
@@ -451,7 +460,12 @@ static mp_cmd_t *get_cmd_from_keys(struct input_ctx *ictx, char *force_section,
     if (ictx->opts->test)
         return handle_test(ictx, code);
 
-    struct cmd_bind *cmd = find_any_bind_for_key(ictx, force_section, code);
+    struct cmd_bind *cmd = NULL;
+
+    if (MP_KEY_IS_UNICODE(code))
+        cmd = find_any_bind_for_key(ictx, force_section, MP_KEY_ANY_UNICODE);
+    if (!cmd)
+        cmd = find_any_bind_for_key(ictx, force_section, code);
     if (!cmd)
         cmd = find_any_bind_for_key(ictx, force_section, MP_KEY_UNMAPPED);
     if (!cmd) {
@@ -459,7 +473,7 @@ static mp_cmd_t *get_cmd_from_keys(struct input_ctx *ictx, char *force_section,
             return mp_input_parse_cmd_strv(ictx->log, (const char*[]){"quit", 0});
         int msgl = MSGL_WARN;
         if (MP_KEY_IS_MOUSE_MOVE(code))
-            msgl = MSGL_DEBUG;
+            msgl = MSGL_TRACE;
         char *key_buf = mp_input_get_key_combo_name(&code, 1);
         MP_MSG(ictx, msgl, "No key binding found for key '%s'.\n", key_buf);
         talloc_free(key_buf);
@@ -469,8 +483,13 @@ static mp_cmd_t *get_cmd_from_keys(struct input_ctx *ictx, char *force_section,
     if (ret) {
         ret->input_section = cmd->owner->section;
         ret->key_name = talloc_steal(ret, mp_input_get_key_combo_name(&code, 1));
-        MP_DBG(ictx, "key '%s' -> '%s' in '%s'\n",
-               ret->key_name, cmd->cmd, ret->input_section);
+        MP_TRACE(ictx, "key '%s' -> '%s' in '%s'\n",
+                 ret->key_name, cmd->cmd, ret->input_section);
+        if (MP_KEY_IS_UNICODE(code)) {
+            bstr text = {0};
+            mp_append_utf8_bstr(ret, &text, code);
+            ret->key_text = text.start;
+        }
         ret->is_mouse_button = code & MP_KEY_EMIT_ON_UP;
     } else {
         char *key_buf = mp_input_get_key_combo_name(&code, 1);
@@ -492,8 +511,8 @@ static void update_mouse_section(struct input_ctx *ictx)
     ictx->mouse_section = new_section;
 
     if (strcmp(old, ictx->mouse_section) != 0) {
-        MP_DBG(ictx, "input: switch section %s -> %s\n",
-               old, ictx->mouse_section);
+        MP_TRACE(ictx, "input: switch section %s -> %s\n",
+                 old, ictx->mouse_section);
         mp_input_queue_cmd(ictx, get_cmd_from_keys(ictx, old, MP_KEY_MOUSE_LEAVE));
     }
 }
@@ -524,13 +543,11 @@ static void release_down_cmd(struct input_ctx *ictx, bool drop_current)
 }
 
 // We don't want the append to the command queue indefinitely, because that
-// could lead to situations where recovery would take too long. On the other
-// hand, don't drop commands that will abort playback.
+// could lead to situations where recovery would take too long.
 static bool should_drop_cmd(struct input_ctx *ictx, struct mp_cmd *cmd)
 {
     struct cmd_queue *queue = &ictx->cmd_queue;
-    return queue_count_cmds(queue) >= ictx->opts->key_fifo_size &&
-           !mp_input_is_abort_cmd(cmd);
+    return queue_count_cmds(queue) >= ictx->opts->key_fifo_size;
 }
 
 static struct mp_cmd *resolve_key(struct input_ctx *ictx, int code)
@@ -538,22 +555,23 @@ static struct mp_cmd *resolve_key(struct input_ctx *ictx, int code)
     update_mouse_section(ictx);
     struct mp_cmd *cmd = get_cmd_from_keys(ictx, NULL, code);
     key_buf_add(ictx->key_history, code);
-    if (cmd && cmd->id != MP_CMD_IGNORE && !should_drop_cmd(ictx, cmd))
+    if (cmd && !cmd->def->is_ignore && !should_drop_cmd(ictx, cmd))
         return cmd;
     talloc_free(cmd);
     return NULL;
 }
 
-static void interpret_key(struct input_ctx *ictx, int code, double scale)
+static void interpret_key(struct input_ctx *ictx, int code, double scale,
+                          int scale_units)
 {
     int state = code & (MP_KEY_STATE_DOWN | MP_KEY_STATE_UP);
     code = code & ~(unsigned)state;
 
-    if (mp_msg_test(ictx->log, MSGL_DEBUG)) {
+    if (mp_msg_test(ictx->log, MSGL_TRACE)) {
         char *key = mp_input_get_key_name(code);
-        MP_DBG(ictx, "key code=%#x '%s'%s%s\n",
-               code, key, (state & MP_KEY_STATE_DOWN) ? " down" : "",
-               (state & MP_KEY_STATE_UP) ? " up" : "");
+        MP_TRACE(ictx, "key code=%#x '%s'%s%s\n",
+                 code, key, (state & MP_KEY_STATE_DOWN) ? " down" : "",
+                 (state & MP_KEY_STATE_UP) ? " up" : "");
         talloc_free(key);
     }
 
@@ -606,8 +624,88 @@ static void interpret_key(struct input_ctx *ictx, int code, double scale)
 
     memset(ictx->key_history, 0, sizeof(ictx->key_history));
 
-    cmd->scale = scale;
-    mp_input_queue_cmd(ictx, cmd);
+    if (mp_input_is_scalable_cmd(cmd)) {
+        cmd->scale = scale;
+        cmd->scale_units = scale_units;
+        mp_input_queue_cmd(ictx, cmd);
+    } else {
+        // Non-scalable commands won't understand cmd->scale, so synthesize
+        // multiple commands with cmd->scale = 1
+        cmd->scale = 1;
+        cmd->scale_units = 1;
+        // Avoid spamming the player with too many commands
+        scale_units = MPMIN(scale_units, 20);
+        for (int i = 0; i < scale_units - 1; i++)
+            mp_input_queue_cmd(ictx, mp_cmd_clone(cmd));
+        if (scale_units)
+            mp_input_queue_cmd(ictx, cmd);
+    }
+}
+
+// Pre-processing for MP_WHEEL_* events. If this returns false, the caller
+// should discard the event.
+static bool process_wheel(struct input_ctx *ictx, int code, double *scale,
+                          int *scale_units)
+{
+    // Size of the deadzone in scroll units. The user must scroll at least this
+    // much in any direction before their scroll is registered.
+    static const double DEADZONE_DIST = 0.125;
+    // The deadzone accumulator is reset if no scrolls happened in this many
+    // seconds, eg. the user is assumed to have finished scrolling.
+    static const double DEADZONE_SCROLL_TIME = 0.2;
+    // The scale_units accumulator is reset if no scrolls happened in this many
+    // seconds. This value should be fairly large, so commands will still be
+    // sent when the user scrolls slowly.
+    static const double UNIT_SCROLL_TIME = 0.5;
+
+    // Determine which direction is being scrolled
+    double dir;
+    struct wheel_state *state;
+    switch (code) {
+    case MP_WHEEL_UP:    dir = -1; state = &ictx->wheel_state_y; break;
+    case MP_WHEEL_DOWN:  dir = +1; state = &ictx->wheel_state_y; break;
+    case MP_WHEEL_LEFT:  dir = -1; state = &ictx->wheel_state_x; break;
+    case MP_WHEEL_RIGHT: dir = +1; state = &ictx->wheel_state_x; break;
+    default:
+        return true;
+    }
+
+    // Reset accumulators if it's determined that the user finished scrolling
+    double now = mp_time_sec();
+    if (now > ictx->last_wheel_time + DEADZONE_SCROLL_TIME) {
+        ictx->wheel_current = NULL;
+        ictx->wheel_state_y.dead_zone_accum = 0;
+        ictx->wheel_state_x.dead_zone_accum = 0;
+    }
+    if (now > ictx->last_wheel_time + UNIT_SCROLL_TIME) {
+        ictx->wheel_state_y.unit_accum = 0;
+        ictx->wheel_state_x.unit_accum = 0;
+    }
+    ictx->last_wheel_time = now;
+
+    // Process wheel deadzone. A lot of touchpad drivers don't filter scroll
+    // input, which makes it difficult for the user to send WHEEL_UP/DOWN
+    // without accidentally triggering WHEEL_LEFT/RIGHT. We try to fix this by
+    // implementing a deadzone. When the value of either direction breaks out
+    // of the deadzone, events from the other direction will be ignored until
+    // the user finishes scrolling.
+    if (ictx->wheel_current == NULL) {
+        state->dead_zone_accum += *scale * dir;
+        if (state->dead_zone_accum * dir > DEADZONE_DIST) {
+            ictx->wheel_current = state;
+            *scale = state->dead_zone_accum * dir;
+        }
+    }
+    if (ictx->wheel_current != state)
+        return false;
+
+    // Determine scale_units. This is incremented every time the accumulated
+    // scale value crosses 1.0. Non-scalable input commands will be ran that
+    // many times.
+    state->unit_accum += *scale * dir;
+    *scale_units = trunc(state->unit_accum * dir);
+    state->unit_accum -= *scale_units * dir;
+    return true;
 }
 
 static void mp_input_feed_key(struct input_ctx *ictx, int code, double scale,
@@ -618,29 +716,39 @@ static void mp_input_feed_key(struct input_ctx *ictx, int code, double scale,
     code = mp_normalize_keycode(code);
     int unmod = code & ~MP_KEY_MODIFIER_MASK;
     if (code == MP_INPUT_RELEASE_ALL) {
-        MP_DBG(ictx, "release all\n");
+        MP_TRACE(ictx, "release all\n");
         release_down_cmd(ictx, false);
         return;
     }
     if (!opts->enable_mouse_movements && MP_KEY_IS_MOUSE(unmod) && !force_mouse)
         return;
     if (unmod == MP_KEY_MOUSE_LEAVE || unmod == MP_KEY_MOUSE_ENTER) {
+        ictx->mouse_hover = unmod == MP_KEY_MOUSE_ENTER;
         update_mouse_section(ictx);
-        mp_input_queue_cmd(ictx, get_cmd_from_keys(ictx, NULL, code));
+
+        mp_cmd_t *cmd = get_cmd_from_keys(ictx, NULL, code);
+        if (!cmd)  // queue dummy cmd so that mouse-pos can notify observers
+            cmd = mp_input_parse_cmd(ictx, bstr0("ignore"), "<internal>");
+        mp_input_queue_cmd(ictx, cmd);
         return;
     }
     double now = mp_time_sec();
     // ignore system-doubleclick if we generate these events ourselves
     if (!force_mouse && opts->doubleclick_time && MP_KEY_IS_MOUSE_BTN_DBL(unmod))
         return;
-    interpret_key(ictx, code, scale);
+    int units = 1;
+    if (MP_KEY_IS_WHEEL(unmod) && !process_wheel(ictx, unmod, &scale, &units))
+        return;
+    interpret_key(ictx, code, scale, units);
     if (code & MP_KEY_STATE_DOWN) {
         code &= ~MP_KEY_STATE_DOWN;
         if (ictx->last_doubleclick_key_down == code &&
             now - ictx->last_doubleclick_time < opts->doubleclick_time / 1000.0)
         {
-            if (code >= MP_MOUSE_BTN0 && code <= MP_MOUSE_BTN2)
-                interpret_key(ictx, code - MP_MOUSE_BTN0 + MP_MOUSE_BTN0_DBL, 1);
+            if (code >= MP_MBTN_LEFT && code <= MP_MBTN_RIGHT) {
+                interpret_key(ictx, code - MP_MBTN_BASE + MP_MBTN_DBL_BASE,
+                              1, 1);
+            }
         }
         ictx->last_doubleclick_key_down = code;
         ictx->last_doubleclick_time = now;
@@ -671,7 +779,7 @@ void mp_input_put_key_utf8(struct input_ctx *ictx, int mods, struct bstr t)
     }
 }
 
-void mp_input_put_axis(struct input_ctx *ictx, int direction, double value)
+void mp_input_put_wheel(struct input_ctx *ictx, int direction, double value)
 {
     if (value == 0.0)
         return;
@@ -721,7 +829,7 @@ void mp_input_set_mouse_pos(struct input_ctx *ictx, int x, int y)
 void mp_input_set_mouse_pos_artificial(struct input_ctx *ictx, int x, int y)
 {
     input_lock(ictx);
-    MP_DBG(ictx, "mouse move %d/%d\n", x, y);
+    MP_TRACE(ictx, "mouse move %d/%d\n", x, y);
 
     if (ictx->mouse_vo_x == x && ictx->mouse_vo_y == y) {
         input_unlock(ictx);
@@ -737,7 +845,7 @@ void mp_input_set_mouse_pos_artificial(struct input_ctx *ictx, int x, int y)
             x = x * 1.0 / (dst->x1 - dst->x0) * (src->x1 - src->x0) + src->x0;
             y = y * 1.0 / (dst->y1 - dst->y0) * (src->y1 - src->y0) + src->y0;
         }
-        MP_DBG(ictx, "-> %d/%d\n", x, y);
+        MP_TRACE(ictx, "-> %d/%d\n", x, y);
     }
 
     ictx->mouse_event_counter++;
@@ -785,31 +893,15 @@ static void adjust_max_wait_time(struct input_ctx *ictx, double *time)
 {
     struct input_opts *opts = ictx->opts;
     if (ictx->last_key_down && opts->ar_rate > 0 && ictx->ar_state >= 0) {
-        *time = FFMIN(*time, 1.0 / opts->ar_rate);
-        *time = FFMIN(*time, opts->ar_delay / 1000.0);
+        *time = MPMIN(*time, 1.0 / opts->ar_rate);
+        *time = MPMIN(*time, opts->ar_delay / 1000.0);
     }
-}
-
-static bool test_abort_cmd(struct input_ctx *ictx, struct mp_cmd *new)
-{
-    if (!mp_input_is_maybe_abort_cmd(new))
-        return false;
-    if (mp_input_is_abort_cmd(new))
-        return true;
-    // Abort only if there are going to be at least 2 commands in the queue.
-    for (struct mp_cmd *cmd = ictx->cmd_queue.first; cmd; cmd = cmd->queue_next) {
-        if (mp_input_is_maybe_abort_cmd(cmd))
-            return true;
-    }
-    return false;
 }
 
 int mp_input_queue_cmd(struct input_ctx *ictx, mp_cmd_t *cmd)
 {
     input_lock(ictx);
     if (cmd) {
-        if (ictx->cancel && test_abort_cmd(ictx, cmd))
-            mp_cancel_trigger(ictx->cancel);
         queue_add_tail(&ictx->cmd_queue, cmd);
         mp_input_wakeup(ictx);
     }
@@ -879,11 +971,12 @@ mp_cmd_t *mp_input_read_cmd(struct input_ctx *ictx)
     return ret;
 }
 
-void mp_input_get_mouse_pos(struct input_ctx *ictx, int *x, int *y)
+void mp_input_get_mouse_pos(struct input_ctx *ictx, int *x, int *y, int *hover)
 {
     input_lock(ictx);
     *x = ictx->mouse_x;
     *y = ictx->mouse_y;
+    *hover = ictx->mouse_hover;
     input_unlock(ictx);
 }
 
@@ -918,7 +1011,7 @@ void mp_input_enable_section(struct input_ctx *ictx, char *name, int flags)
 
     mp_input_disable_section(ictx, name);
 
-    MP_DBG(ictx, "enable section '%s'\n", name);
+    MP_TRACE(ictx, "enable section '%s'\n", name);
 
     if (ictx->num_active_sections < MAX_ACTIVE_SECTIONS) {
         int top = ictx->num_active_sections;
@@ -935,10 +1028,10 @@ void mp_input_enable_section(struct input_ctx *ictx, char *name, int flags)
         ictx->num_active_sections++;
     }
 
-    MP_DBG(ictx, "active section stack:\n");
+    MP_TRACE(ictx, "active section stack:\n");
     for (int n = 0; n < ictx->num_active_sections; n++) {
-        MP_DBG(ictx, " %s %d\n", ictx->active_sections[n].name,
-               ictx->active_sections[n].flags);
+        MP_TRACE(ictx, " %s %d\n", ictx->active_sections[n].name,
+                 ictx->active_sections[n].flags);
     }
 
     input_unlock(ictx);
@@ -997,6 +1090,7 @@ static void bind_dealloc(struct cmd_bind *bind)
 {
     talloc_free(bind->cmd);
     talloc_free(bind->location);
+    talloc_free(bind->desc);
 }
 
 // builtin: if true, remove all builtin binds, else remove all user binds
@@ -1040,14 +1134,13 @@ void mp_input_define_section(struct input_ctx *ictx, char *name, char *location,
 void mp_input_remove_sections_by_owner(struct input_ctx *ictx, char *owner)
 {
     input_lock(ictx);
-    struct cmd_bind_section *bs = ictx->cmd_bind_sections;
-    while (bs) {
+    for (int n = 0; n < ictx->num_sections; n++) {
+        struct cmd_bind_section *bs = ictx->sections[n];
         if (bs->owner && owner && strcmp(bs->owner, owner) == 0) {
             mp_input_disable_section(ictx, bs->section);
             remove_binds(bs, false);
             remove_binds(bs, true);
         }
-        bs = bs->next;
     }
     input_unlock(ictx);
 }
@@ -1065,7 +1158,7 @@ static bool bind_matches_key(struct cmd_bind *bind, int num_keys, const int *key
 
 static void bind_keys(struct input_ctx *ictx, bool builtin, bstr section,
                       const int *keys, int num_keys, bstr command,
-                      const char *loc)
+                      const char *loc, const char *desc)
 {
     struct cmd_bind_section *bs = get_bind_section(ictx, section);
     struct cmd_bind *bind = NULL;
@@ -1091,6 +1184,7 @@ static void bind_keys(struct input_ctx *ictx, bool builtin, bstr section,
     *bind = (struct cmd_bind) {
         .cmd = bstrdup0(bs->binds, command),
         .location = talloc_strdup(bs->binds, loc),
+        .desc = talloc_strdup(bs->binds, desc),
         .owner = bs,
         .is_builtin = builtin,
         .num_keys = num_keys,
@@ -1098,9 +1192,9 @@ static void bind_keys(struct input_ctx *ictx, bool builtin, bstr section,
     memcpy(bind->keys, keys, num_keys * sizeof(bind->keys[0]));
     if (mp_msg_test(ictx->log, MSGL_DEBUG)) {
         char *s = mp_input_get_key_combo_name(keys, num_keys);
-        MP_DBG(ictx, "add: section='%s' key='%s'%s cmd='%s' location='%s'\n",
-               bind->owner->section, s, bind->is_builtin ? " builtin" : "",
-               bind->cmd, bind->location);
+        MP_TRACE(ictx, "add: section='%s' key='%s'%s cmd='%s' location='%s'\n",
+                 bind->owner->section, s, bind->is_builtin ? " builtin" : "",
+                 bind->cmd, bind->location);
         talloc_free(s);
     }
 }
@@ -1166,11 +1260,18 @@ static int parse_config(struct input_ctx *ictx, bool builtin, bstr data,
             }
         }
 
-        bind_keys(ictx, builtin, section, keys, num_keys, command, cur_loc);
+        // Print warnings if invalid commands are encountered.
+        struct mp_cmd *cmd = mp_input_parse_cmd(ictx, command, cur_loc);
+        const char *desc = NULL;
+        if (cmd) {
+            desc = cmd->desc;
+            command = bstr0(cmd->original);
+        }
+
+        bind_keys(ictx, builtin, section, keys, num_keys, command, cur_loc, desc);
         n_binds++;
 
-        // Print warnings if invalid commands are encountered.
-        talloc_free(mp_input_parse_cmd(ictx, command, cur_loc));
+        talloc_free(cmd);
     }
 
     talloc_free(cur_loc);
@@ -1186,7 +1287,7 @@ static int parse_config_file(struct input_ctx *ictx, char *file, bool warn)
 
     file = mp_get_user_path(tmp, ictx->global, file);
 
-    s = stream_open(file, ictx->global);
+    s = stream_create(file, STREAM_ORIGIN_DIRECT | STREAM_READ, NULL, ictx->global);
     if (!s) {
         MP_ERR(ictx, "Can't open input config file %s.\n", file);
         goto done;
@@ -1242,15 +1343,6 @@ static void reload_opts(struct input_ctx *ictx, bool shutdown)
 #if HAVE_COCOA
     struct input_opts *opts = ictx->opts;
 
-    if (ictx->using_ar != (opts->use_appleremote && !shutdown)) {
-        ictx->using_ar = !ictx->using_ar;
-        if (ictx->using_ar) {
-            cocoa_init_apple_remote();
-        } else {
-            cocoa_uninit_apple_remote();
-        }
-    }
-
     if (ictx->using_cocoa_media_keys != (opts->use_media_keys && !shutdown)) {
         ictx->using_cocoa_media_keys = !ictx->using_cocoa_media_keys;
         if (ictx->using_cocoa_media_keys) {
@@ -1278,7 +1370,7 @@ void mp_input_load_config(struct input_ctx *ictx)
     // "Uncomment" the default key bindings in etc/input.conf and add them.
     // All lines that do not start with '# ' are parsed.
     bstr builtin = bstr0(builtin_input_conf);
-    while (builtin.len) {
+    while (ictx->opts->builtin_bindings && builtin.len) {
         bstr line = bstr_getline(builtin, &builtin);
         bstr_eatstart0(&line, "#");
         if (!bstr_startswith0(line, " "))
@@ -1297,14 +1389,10 @@ void mp_input_load_config(struct input_ctx *ictx)
         talloc_free(tmp);
     }
 
-#if HAVE_COCOA
-    if (ictx->opts->use_app_events)
-        cocoa_start_event_monitor();
-#endif
-
-#if defined(__MINGW32__)
-    if (ictx->global->opts->input_file && *ictx->global->opts->input_file)
-        mp_input_pipe_add(ictx, ictx->global->opts->input_file);
+#if HAVE_SDL2_GAMEPAD
+    if (ictx->opts->use_gamepad) {
+        mp_input_sdl_gamepad_add(ictx);
+    }
 #endif
 
     input_unlock(ictx);
@@ -1335,13 +1423,6 @@ void mp_input_uninit(struct input_ctx *ictx)
     talloc_free(ictx);
 }
 
-void mp_input_set_cancel(struct input_ctx *ictx, struct mp_cancel *cancel)
-{
-    input_lock(ictx);
-    ictx->cancel = cancel;
-    input_unlock(ictx);
-}
-
 bool mp_input_use_alt_gr(struct input_ctx *ictx)
 {
     input_lock(ictx);
@@ -1350,15 +1431,111 @@ bool mp_input_use_alt_gr(struct input_ctx *ictx)
     return r;
 }
 
+bool mp_input_use_media_keys(struct input_ctx *ictx)
+{
+    input_lock(ictx);
+    bool r = ictx->opts->use_media_keys;
+    input_unlock(ictx);
+    return r;
+}
+
 struct mp_cmd *mp_input_parse_cmd(struct input_ctx *ictx, bstr str,
                                   const char *location)
 {
-    return mp_input_parse_cmd_(ictx->log, str, location);
+    return mp_input_parse_cmd_str(ictx->log, str, location);
 }
 
 void mp_input_run_cmd(struct input_ctx *ictx, const char **cmd)
 {
     mp_input_queue_cmd(ictx, mp_input_parse_cmd_strv(ictx->log, cmd));
+}
+
+void mp_input_bind_key(struct input_ctx *ictx, int key, bstr command)
+{
+    struct cmd_bind_section *bs = get_bind_section(ictx, (bstr){0});
+    struct cmd_bind *bind = NULL;
+
+    for (int n = 0; n < bs->num_binds; n++) {
+        struct cmd_bind *b = &bs->binds[n];
+        if (bind_matches_key(b, 1, &key) && b->is_builtin == false) {
+            bind = b;
+            break;
+        }
+    }
+
+    if (!bind) {
+        struct cmd_bind empty = {{0}};
+        MP_TARRAY_APPEND(bs, bs->binds, bs->num_binds, empty);
+        bind = &bs->binds[bs->num_binds - 1];
+    }
+
+    bind_dealloc(bind);
+
+    *bind = (struct cmd_bind) {
+        .cmd = bstrdup0(bs->binds, command),
+        .location = talloc_strdup(bs->binds, "keybind-command"),
+        .owner = bs,
+        .is_builtin = false,
+        .num_keys = 1,
+    };
+    memcpy(bind->keys, &key, 1 * sizeof(bind->keys[0]));
+    if (mp_msg_test(ictx->log, MSGL_DEBUG)) {
+        char *s = mp_input_get_key_combo_name(&key, 1);
+        MP_TRACE(ictx, "add:section='%s' key='%s'%s cmd='%s' location='%s'\n",
+                 bind->owner->section, s, bind->is_builtin ? " builtin" : "",
+                 bind->cmd, bind->location);
+        talloc_free(s);
+    }
+}
+
+struct mpv_node mp_input_get_bindings(struct input_ctx *ictx)
+{
+    input_lock(ictx);
+    struct mpv_node root;
+    node_init(&root, MPV_FORMAT_NODE_ARRAY, NULL);
+
+    for (int x = 0; x < ictx->num_sections; x++) {
+        struct cmd_bind_section *s = ictx->sections[x];
+        int priority = -1;
+
+        for (int i = 0; i < ictx->num_active_sections; i++) {
+            struct active_section *as = &ictx->active_sections[i];
+            if (strcmp(as->name, s->section) == 0) {
+                priority = i;
+                break;
+            }
+        }
+
+        for (int n = 0; n < s->num_binds; n++) {
+            struct cmd_bind *b = &s->binds[n];
+            struct mpv_node *entry = node_array_add(&root, MPV_FORMAT_NODE_MAP);
+
+            int b_priority = priority;
+            if (b->is_builtin && !ictx->opts->default_bindings)
+                b_priority = -1;
+
+            // Try to fixup the weird logic so consumer of this bindings list
+            // does not get too confused.
+            if (b_priority >= 0 && !b->is_builtin)
+                b_priority += ictx->num_active_sections;
+
+            node_map_add_string(entry, "section", s->section);
+            if (s->owner)
+                node_map_add_string(entry, "owner", s->owner);
+            node_map_add_string(entry, "cmd", b->cmd);
+            node_map_add_flag(entry, "is_weak", b->is_builtin);
+            node_map_add_int64(entry, "priority", b_priority);
+            if (b->desc)
+                node_map_add_string(entry, "comment", b->desc);
+
+            char *key = mp_input_get_key_combo_name(b->keys, b->num_keys);
+            node_map_add_string(entry, "key", key);
+            talloc_free(key);
+        }
+    }
+
+    input_unlock(ictx);
+    return root;
 }
 
 struct mp_input_src_internal {
@@ -1506,7 +1683,7 @@ void mp_input_src_feed_cmd_text(struct mp_input_src *src, char *buf, size_t len)
             if (term) {
                 bstr s = {in->cmd_buffer, in->cmd_buffer_size};
                 s = bstr_strip(s);
-                struct mp_cmd *cmd= mp_input_parse_cmd_(src->log, s, "<>");
+                struct mp_cmd *cmd = mp_input_parse_cmd_str(src->log, s, "<>");
                 if (cmd)
                     mp_input_queue_cmd(src->input_ctx, cmd);
                 in->cmd_buffer_size = 0;

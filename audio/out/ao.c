@@ -1,23 +1,24 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <assert.h>
 
 #include "mpv_talloc.h"
@@ -26,19 +27,21 @@
 #include "ao.h"
 #include "internal.h"
 #include "audio/format.h"
-#include "audio/audio.h"
 
 #include "options/options.h"
-#include "options/m_config.h"
+#include "options/m_config_frontend.h"
+#include "osdep/endian.h"
 #include "common/msg.h"
 #include "common/common.h"
 #include "common/global.h"
 
 extern const struct ao_driver audio_out_oss;
+extern const struct ao_driver audio_out_audiotrack;
 extern const struct ao_driver audio_out_audiounit;
 extern const struct ao_driver audio_out_coreaudio;
 extern const struct ao_driver audio_out_coreaudio_exclusive;
 extern const struct ao_driver audio_out_rsound;
+extern const struct ao_driver audio_out_pipewire;
 extern const struct ao_driver audio_out_sndio;
 extern const struct ao_driver audio_out_pulse;
 extern const struct ao_driver audio_out_jack;
@@ -53,6 +56,9 @@ extern const struct ao_driver audio_out_sdl;
 
 static const struct ao_driver * const audio_out_drivers[] = {
 // native:
+#if HAVE_ANDROID
+    &audio_out_audiotrack,
+#endif
 #if HAVE_AUDIOUNIT
     &audio_out_audiounit,
 #endif
@@ -81,8 +87,11 @@ static const struct ao_driver * const audio_out_drivers[] = {
 #if HAVE_OPENSLES
     &audio_out_opensles,
 #endif
-#if HAVE_SDL1 || HAVE_SDL2
+#if HAVE_SDL2_AUDIO
     &audio_out_sdl,
+#endif
+#if HAVE_PIPEWIRE
+    &audio_out_pipewire,
 #endif
 #if HAVE_SNDIO
     &audio_out_sndio,
@@ -92,12 +101,7 @@ static const struct ao_driver * const audio_out_drivers[] = {
     &audio_out_coreaudio_exclusive,
 #endif
     &audio_out_pcm,
-#if HAVE_ENCODING
     &audio_out_lavc,
-#endif
-#if HAVE_RSOUND
-    &audio_out_rsound,
-#endif
     NULL
 };
 
@@ -121,13 +125,31 @@ static bool get_desc(struct m_obj_desc *dst, int index)
 }
 
 // For the ao option
-const struct m_obj_list ao_obj_list = {
+static const struct m_obj_list ao_obj_list = {
     .get_desc = get_desc,
     .description = "audio outputs",
-    .allow_unknown_entries = true,
     .allow_trailer = true,
     .disallow_positional_parameters = true,
     .use_global_options = true,
+};
+
+#define OPT_BASE_STRUCT struct ao_opts
+const struct m_sub_options ao_conf = {
+    .opts = (const struct m_option[]) {
+        {"ao", OPT_SETTINGSLIST(audio_driver_list, &ao_obj_list),
+            .flags = UPDATE_AUDIO},
+        {"audio-device", OPT_STRING(audio_device), .flags = UPDATE_AUDIO},
+        {"audio-client-name", OPT_STRING(audio_client_name), .flags = UPDATE_AUDIO},
+        {"audio-buffer", OPT_DOUBLE(audio_buffer),
+            .flags = UPDATE_AUDIO, M_RANGE(0, 10)},
+        {0}
+    },
+    .size = sizeof(OPT_BASE_STRUCT),
+    .defaults = &(const OPT_BASE_STRUCT){
+        .audio_buffer = 0.2,
+        .audio_device = "auto",
+        .audio_client_name = "mpv",
+    },
 };
 
 static struct ao *ao_alloc(bool probing, struct mpv_global *global,
@@ -136,7 +158,6 @@ static struct ao *ao_alloc(bool probing, struct mpv_global *global,
 {
     assert(wakeup_cb);
 
-    struct MPOpts *opts = global->opts;
     struct mp_log *log = mp_log_new(NULL, global->log, "ao");
     struct m_obj_desc desc;
     if (!m_obj_list_find(&desc, &ao_obj_list, bstr0(name))) {
@@ -144,6 +165,7 @@ static struct ao *ao_alloc(bool probing, struct mpv_global *global,
         talloc_free(log);
         return NULL;
     };
+    struct ao_opts *opts = mp_get_config_group(NULL, global, &ao_conf);
     struct ao *ao = talloc_ptrtype(NULL, ao);
     talloc_steal(ao, log);
     *ao = (struct ao) {
@@ -156,9 +178,11 @@ static struct ao *ao_alloc(bool probing, struct mpv_global *global,
         .def_buffer = opts->audio_buffer,
         .client_name = talloc_strdup(ao, opts->audio_client_name),
     };
+    talloc_free(opts);
     ao->priv = m_config_group_from_desc(ao, ao->log, global, &desc, name);
     if (!ao->priv)
         goto error;
+    ao_set_gain(ao, 1.0f);
     return ao;
 error:
     talloc_free(ao);
@@ -187,12 +211,9 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
                af_fmt_to_str(ao->format));
 
     ao->device = talloc_strdup(ao, dev);
-
-    ao->api = ao->driver->play ? &ao_api_push : &ao_api_pull;
-    ao->api_priv = talloc_zero_size(ao, ao->api->priv_size);
-    assert(!ao->api->priv_defaults && !ao->api->options);
-
     ao->stream_silence = flags & AO_INIT_STREAM_SILENCE;
+
+    init_buffer_pre(ao);
 
     int r = ao->driver->init(ao);
     if (r < 0) {
@@ -201,13 +222,14 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
             char redirect[80], rdevice[80];
             snprintf(redirect, sizeof(redirect), "%s", ao->redirect);
             snprintf(rdevice, sizeof(rdevice), "%s", ao->device ? ao->device : "");
-            talloc_free(ao);
+            ao_uninit(ao);
             return ao_init(probing, global, wakeup_cb, wakeup_ctx,
                            encode_lavc_ctx, flags, samplerate, format, channels,
                            rdevice, redirect);
         }
         goto fail;
     }
+    ao->driver_initialized = true;
 
     ao->sstride = af_fmt_to_bytes(ao->format);
     ao->num_planes = 1;
@@ -218,22 +240,25 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
     }
     ao->bps = ao->samplerate * ao->sstride;
 
-    if (!ao->device_buffer && ao->driver->get_space)
-        ao->device_buffer = ao->driver->get_space(ao);
+    if (ao->device_buffer <= 0 && ao->driver->write) {
+        MP_ERR(ao, "Device buffer size not set.\n");
+        goto fail;
+    }
     if (ao->device_buffer)
         MP_VERBOSE(ao, "device buffer: %d samples.\n", ao->device_buffer);
     ao->buffer = MPMAX(ao->device_buffer, ao->def_buffer * ao->samplerate);
+    ao->buffer = MPMAX(ao->buffer, 1);
 
     int align = af_format_sample_alignment(ao->format);
     ao->buffer = (ao->buffer + align - 1) / align * align;
     MP_VERBOSE(ao, "using soft-buffer of %d samples.\n", ao->buffer);
 
-    if (ao->api->init(ao) < 0)
+    if (!init_buffer_post(ao))
         goto fail;
     return ao;
 
 fail:
-    talloc_free(ao);
+    ao_uninit(ao);
     return NULL;
 }
 
@@ -245,9 +270,10 @@ static void split_ao_device(void *tmp, char *opt, char **out_ao, char **out_dev)
         return;
     if (!opt[0] || strcmp(opt, "auto") == 0)
         return;
-    // Split on "/". If there's no "/", leave out_device NULL.
+    // Split on "/". If "/" is the final character, or absent, out_dev is NULL.
     bstr b_dev, b_ao;
-    if (bstr_split_tok(bstr0(opt), "/", &b_ao, &b_dev))
+    bstr_split_tok(bstr0(opt), "/", &b_ao, &b_dev);
+    if (b_dev.len > 0)
         *out_dev = bstrto0(tmp, b_dev);
     *out_ao = bstrto0(tmp, b_ao);
 }
@@ -258,8 +284,8 @@ struct ao *ao_init_best(struct mpv_global *global,
                         struct encode_lavc_context *encode_lavc_ctx,
                         int samplerate, int format, struct mp_chmap channels)
 {
-    struct MPOpts *opts = global->opts;
     void *tmp = talloc_new(NULL);
+    struct ao_opts *opts = mp_get_config_group(tmp, global, &ao_conf);
     struct mp_log *log = mp_log_new(tmp, global->log, "ao");
     struct ao *ao = NULL;
     struct m_obj_settings *ao_list = NULL;
@@ -326,95 +352,20 @@ struct ao *ao_init_best(struct mpv_global *global,
     return ao;
 }
 
-// Uninitialize and destroy the AO. Remaining audio must be dropped.
-void ao_uninit(struct ao *ao)
-{
-    if (ao)
-        ao->api->uninit(ao);
-    talloc_free(ao);
-}
-
-// Queue the given audio data. Start playback if it hasn't started yet. Return
-// the number of samples that was accepted (the core will try to queue the rest
-// again later). Should never block.
-//  data: start pointer for each plane. If the audio data is packed, only
-//        data[0] is valid, otherwise there is a plane for each channel.
-//  samples: size of the audio data (see ao->sstride)
-//  flags: currently AOPLAY_FINAL_CHUNK can be set
-int ao_play(struct ao *ao, void **data, int samples, int flags)
-{
-    return ao->api->play(ao, data, samples, flags);
-}
-
-int ao_control(struct ao *ao, enum aocontrol cmd, void *arg)
-{
-    return ao->api->control ? ao->api->control(ao, cmd, arg) : CONTROL_UNKNOWN;
-}
-
-// Return size of the buffered data in seconds. Can include the device latency.
-// Basically, this returns how much data there is still to play, and how long
-// it takes until the last sample in the buffer reaches the speakers. This is
-// used for audio/video synchronization, so it's very important to implement
-// this correctly.
-double ao_get_delay(struct ao *ao)
-{
-    return ao->api->get_delay(ao);
-}
-
-// Return free size of the internal audio buffer. This controls how much audio
-// the core should decode and try to queue with ao_play().
-int ao_get_space(struct ao *ao)
-{
-    return ao->api->get_space(ao);
-}
-
-// Stop playback and empty buffers. Essentially go back to the state after
-// ao->init().
-void ao_reset(struct ao *ao)
-{
-    if (ao->api->reset)
-        ao->api->reset(ao);
-}
-
-// Pause playback. Keep the current buffer. ao_get_delay() must return the
-// same value as before pausing.
-void ao_pause(struct ao *ao)
-{
-    if (ao->api->pause)
-        ao->api->pause(ao);
-}
-
-// Resume playback. Play the remaining buffer. If the driver doesn't support
-// pausing, it has to work around this and e.g. use ao_play_silence() to fill
-// the lost audio.
-void ao_resume(struct ao *ao)
-{
-    if (ao->api->resume)
-        ao->api->resume(ao);
-}
-
-// Block until the current audio buffer has played completely.
-void ao_drain(struct ao *ao)
-{
-    if (ao->api->drain)
-        ao->api->drain(ao);
-}
-
-bool ao_eof_reached(struct ao *ao)
-{
-    return ao->api->get_eof ? ao->api->get_eof(ao) : true;
-}
-
 // Query the AO_EVENT_*s as requested by the events parameter, and return them.
 int ao_query_and_reset_events(struct ao *ao, int events)
 {
     return atomic_fetch_and(&ao->events_, ~(unsigned)events) & events;
 }
 
-static void ao_add_events(struct ao *ao, int events)
+// Returns events that were set by this calls.
+int ao_add_events(struct ao *ao, int events)
 {
-    atomic_fetch_or(&ao->events_, events);
-    ao->wakeup_cb(ao->wakeup_ctx);
+    unsigned prev_events = atomic_fetch_or(&ao->events_, events);
+    unsigned new = events & ~prev_events;
+    if (new)
+        ao->wakeup_cb(ao->wakeup_ctx);
+    return new;
 }
 
 // Request that the player core destroys and recreates the AO. Fully thread-safe.
@@ -454,7 +405,7 @@ bool ao_chmap_sel_adjust2(struct ao *ao, const struct mp_chmap_sel *s,
             if (!mp_chmap_equals(&res, &(struct mp_chmap)MP_CHMAP_INIT_MONO) &&
                 !mp_chmap_equals(&res, &(struct mp_chmap)MP_CHMAP_INIT_STEREO))
             {
-                MP_WARN(ao, "Disabling multichannel output.\n");
+                MP_VERBOSE(ao, "Disabling multichannel output.\n");
                 *map = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
             }
         }
@@ -471,12 +422,12 @@ bool ao_chmap_sel_get_def(struct ao *ao, const struct mp_chmap_sel *s,
 
 // --- The following functions just return immutable information.
 
-void ao_get_format(struct ao *ao, struct mp_audio *format)
+void ao_get_format(struct ao *ao,
+                   int *samplerate, int *format, struct mp_chmap *channels)
 {
-    *format = (struct mp_audio){0};
-    mp_audio_set_format(format, ao->format);
-    mp_audio_set_channels(format, &ao->channels);
-    format->rate = ao->samplerate;
+    *samplerate = ao->samplerate;
+    *format = ao->format;
+    *channels = ao->channels;
 }
 
 const char *ao_get_name(struct ao *ao)
@@ -542,13 +493,6 @@ bool ao_hotplug_check_update(struct ao_hotplug *hp)
     return false;
 }
 
-const char *ao_hotplug_get_detected_device(struct ao_hotplug *hp)
-{
-    if (!hp || !hp->ao)
-        return NULL;
-    return hp->ao->detected_device;
-}
-
 // The return value is valid until the next call to this API.
 struct ao_device_list *ao_hotplug_get_device_list(struct ao_hotplug *hp)
 {
@@ -605,8 +549,8 @@ void ao_device_list_add(struct ao_device_list *list, struct ao *ao,
             c.desc = "Default";
         }
     }
-    c.name = c.name[0] ? talloc_asprintf(list, "%s/%s", dname, c.name)
-                       : talloc_strdup(list, dname);
+    c.name = (c.name && c.name[0]) ? talloc_asprintf(list, "%s/%s", dname, c.name)
+                                   : talloc_strdup(list, dname);
     c.desc = talloc_strdup(list, c.desc);
     MP_TARRAY_APPEND(list, list->devices, list->num_devices, c);
 }
@@ -635,4 +579,123 @@ void ao_print_devices(struct mpv_global *global, struct mp_log *log)
         mp_info(log, "  '%s' (%s)\n", desc->name, desc->desc);
     }
     ao_hotplug_destroy(hp);
+}
+
+void ao_set_gain(struct ao *ao, float gain)
+{
+    atomic_store(&ao->gain, gain);
+}
+
+#define MUL_GAIN_i(d, num_samples, gain, low, center, high)                     \
+    for (int n = 0; n < (num_samples); n++)                                     \
+        (d)[n] = MPCLAMP(                                                       \
+            ((((int64_t)((d)[n]) - (center)) * (gain) + 128) >> 8) + (center),  \
+            (low), (high))
+
+#define MUL_GAIN_f(d, num_samples, gain)                                        \
+    for (int n = 0; n < (num_samples); n++)                                     \
+        (d)[n] = MPCLAMP(((d)[n]) * (gain), -1.0, 1.0)
+
+static void process_plane(struct ao *ao, void *data, int num_samples)
+{
+    float gain = atomic_load_explicit(&ao->gain, memory_order_relaxed);
+    int gi = lrint(256.0 * gain);
+    if (gi == 256)
+        return;
+    switch (af_fmt_from_planar(ao->format)) {
+    case AF_FORMAT_U8:
+        MUL_GAIN_i((uint8_t *)data, num_samples, gi, 0, 128, 255);
+        break;
+    case AF_FORMAT_S16:
+        MUL_GAIN_i((int16_t *)data, num_samples, gi, INT16_MIN, 0, INT16_MAX);
+        break;
+    case AF_FORMAT_S32:
+        MUL_GAIN_i((int32_t *)data, num_samples, gi, INT32_MIN, 0, INT32_MAX);
+        break;
+    case AF_FORMAT_FLOAT:
+        MUL_GAIN_f((float *)data, num_samples, gain);
+        break;
+    case AF_FORMAT_DOUBLE:
+        MUL_GAIN_f((double *)data, num_samples, gain);
+        break;
+    default:;
+        // all other sample formats are simply not supported
+    }
+}
+
+void ao_post_process_data(struct ao *ao, void **data, int num_samples)
+{
+    bool planar = af_fmt_is_planar(ao->format);
+    int planes = planar ? ao->channels.num : 1;
+    int plane_samples = num_samples * (planar ? 1: ao->channels.num);
+    for (int n = 0; n < planes; n++)
+        process_plane(ao, data[n], plane_samples);
+}
+
+static int get_conv_type(struct ao_convert_fmt *fmt)
+{
+    if (af_fmt_to_bytes(fmt->src_fmt) * 8 == fmt->dst_bits && !fmt->pad_msb)
+        return 0; // passthrough
+    if (fmt->src_fmt == AF_FORMAT_S32 && fmt->dst_bits == 24 && !fmt->pad_msb)
+        return 1; // simple 32->24 bit conversion
+    if (fmt->src_fmt == AF_FORMAT_S32 && fmt->dst_bits == 32 && fmt->pad_msb == 8)
+        return 2; // simple 32->24 bit conversion, with MSB padding
+    return -1; // unsupported
+}
+
+// Check whether ao_convert_inplace() can be called. As an exception, the
+// planar-ness of the sample format and the number of channels is ignored.
+// All other parameters must be as passed to ao_convert_inplace().
+bool ao_can_convert_inplace(struct ao_convert_fmt *fmt)
+{
+    return get_conv_type(fmt) >= 0;
+}
+
+bool ao_need_conversion(struct ao_convert_fmt *fmt)
+{
+    return get_conv_type(fmt) != 0;
+}
+
+// The LSB is always ignored.
+#if BYTE_ORDER == BIG_ENDIAN
+#define SHIFT24(x) ((3-(x))*8)
+#else
+#define SHIFT24(x) (((x)+1)*8)
+#endif
+
+static void convert_plane(int type, void *data, int num_samples)
+{
+    switch (type) {
+    case 0:
+        break;
+    case 1: /* fall through */
+    case 2: {
+        int bytes = type == 1 ? 3 : 4;
+        for (int s = 0; s < num_samples; s++) {
+            uint32_t val = *((uint32_t *)data + s);
+            uint8_t *ptr = (uint8_t *)data + s * bytes;
+            ptr[0] = val >> SHIFT24(0);
+            ptr[1] = val >> SHIFT24(1);
+            ptr[2] = val >> SHIFT24(2);
+            if (type == 2)
+                ptr[3] = 0;
+        }
+        break;
+    }
+    default:
+        abort();
+    }
+}
+
+// data[n] contains the pointer to the first sample of the n-th plane, in the
+// format implied by fmt->src_fmt. src_fmt also controls whether the data is
+// all in one plane, or if there is a plane per channel.
+void ao_convert_inplace(struct ao_convert_fmt *fmt, void **data, int num_samples)
+{
+    int type = get_conv_type(fmt);
+    bool planar = af_fmt_is_planar(fmt->src_fmt);
+    int planes = planar ? fmt->channels : 1;
+    int plane_samples = num_samples * (planar ? 1: fmt->channels);
+    for (int n = 0; n < planes; n++)
+        convert_plane(type, data[n], plane_samples);
 }

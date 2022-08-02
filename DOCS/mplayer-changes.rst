@@ -8,7 +8,10 @@ behaves. Although there are still many similarities to its ancestors, **mpv**
 should generally be treated as a completely different program.
 
 .. admonition:: Warning
-    This document is not updated anymore, and is incomplete and outdated.
+
+    This document is **not updated** anymore, and is **incomplete** and
+    **outdated**. If you look for old option replacements, always check with
+    the current mpv manpage, as the options could have changed meanwhile.
 
 General Changes from MPlayer to mpv
 -----------------------------------
@@ -49,7 +52,7 @@ Input
 * Classic LIRC support was removed. Install remotes as input devices instead.
   This way they will send X11 key events to the mpv window, which can be bound
   using the normal ``input.conf``.
-  Also see: http://github.com/mpv-player/mpv/wiki/IR-remotes
+  Also see: https://github.com/mpv-player/mpv/wiki/IR-remotes
 * Joystick support was removed. It was considered useless and was the cause
   of some problems (e.g. a laptop's accelerator being recognized as joystick).
 * Support for relative seeking by percentage.
@@ -73,8 +76,8 @@ Video
 
 * Wayland support.
 * Native support for VAAPI and VDA. Improved VDPAU video output.
-* Improved OpenGL output (see the ``opengl-hq`` video output).
-* Make hardware decoding work with the ``opengl`` video output.
+* Improved GPU-accelerated video output (see the ``gpu-hq`` preset).
+* Make hardware decoding work with the ``gpu`` video output.
 * Support for libavfilter (for video->video and audio->audio). This allows
   using most of FFmpeg's filters, which improve greatly on the old MPlayer
   filters in features, performance, and correctness.
@@ -82,7 +85,7 @@ Video
   for BT.2020 (Ultra HD). linear XYZ (Digital Cinema) and SMPTE ST2084 (HDR)
   inputs.
 * Support for color managed displays, via ICC profiles.
-* High-quality image resamplers (see the ``opengl`` ``scale`` suboption).
+* High-quality image resamplers (see the ``--scale`` suboption).
 * Support for scaling in (sigmoidized) linear light.
 * Better subtitle rendering using libass by default.
 * Improvements when playing multiple files (``-fixed-vo`` is default, do not
@@ -141,7 +144,6 @@ Mac OS X
 * Native OpenGL backend.
 * Cocoa event loop is independent from MPlayer's event loop, so user
   actions like accessing menus and live resizing do not block the playback.
-* Apple Remote support.
 * Media Keys support.
 * VDA support using libavcodec hwaccel API instead of FFmpeg's decoder with up
   to 2-2.5x reduction in CPU usage.
@@ -209,7 +211,7 @@ Command Line Switches
     ``-no<opt>``                ``--no-<opt>`` (add a dash)
     ``-a52drc level``           ``--ad-lavc-ac3drc=level``
     ``-ac spdifac3``            ``--ad=spdif:ac3`` (see ``--ad=help``)
-    ``-af volnorm``             ``--af=drc`` (renamed)
+    ``-af volnorm``             (removed; use acompressor ffmpeg filter instead)
     ``-afm hwac3``              ``--ad=spdif:ac3,spdif:dts``
     ``-ao alsa:device=hw=0.3``  ``--ao=alsa:device=[hw:0,3]``
     ``-aspect``                 ``--video-aspect``
@@ -245,7 +247,7 @@ Command Line Switches
     ``-msglevel``               ``--msg-level`` (changed semantics)
     ``-msgmodule``              ``--msg-module``
     ``-name``                   ``--x11-name``
-    ``-noar``                   ``--no-input-appleremote``
+    ``-noar``                   ``(removed; replaced by MediaPlayer framework)``
     ``-noautosub``              ``--no-sub-auto``
     ``-noconsolecontrols``      ``--no-input-terminal``
     ``-nosound``                ``--no-audio``

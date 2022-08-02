@@ -1,6 +1,5 @@
 /*
  * This file is part of mpv video player.
- * Copyright © 2013 Alexander Preisinger <alexander.preisinger@gmail.com>
  *
  * mpv is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -19,133 +18,134 @@
 #ifndef MPLAYER_WAYLAND_COMMON_H
 #define MPLAYER_WAYLAND_COMMON_H
 
-#include <stdint.h>
-#include <stdbool.h>
 #include <wayland-client.h>
-#include <wayland-cursor.h>
-#include <xkbcommon/xkbcommon.h>
+#include "input/event.h"
+#include "vo.h"
 
-#include "config.h"
-
-#if HAVE_GL_WAYLAND
-#include <wayland-egl.h>
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#endif
-
-struct vo;
-
-struct vo_wayland_output {
-    uint32_t id; /* unique name */
-    struct wl_output *output;
-    uint32_t flags;
-    int32_t width;
-    int32_t height;
-    int32_t scale;
-    int32_t refresh_rate; // fps (mHz)
-    const char *make;
-    const char *model;
-    struct wl_list link;
+struct wayland_opts {
+    int disable_vsync;
+    int edge_pixels_pointer;
+    int edge_pixels_touch;
 };
-
-typedef void (*vo_wayland_frame_cb)(void *data, uint32_t time);
 
 struct vo_wayland_state {
-    struct vo *vo;
-    struct mp_log* log;
+    struct m_config_cache   *vo_opts_cache;
+    struct mp_log           *log;
+    struct mp_vo_opts       *vo_opts;
+    struct vo               *vo;
+    struct wayland_opts     *opts;
+    struct wl_callback      *frame_callback;
+    struct wl_compositor    *compositor;
+    struct wl_subcompositor *subcompositor;
+    struct wl_display       *display;
+    struct wl_registry      *registry;
+    struct wl_shm           *shm;
+    struct wl_surface       *surface;
+    struct wl_surface       *video_surface;
+    struct wl_subsurface    *video_subsurface;
+
+    /* Geometry */
+    struct mp_rect geometry;
+    struct mp_rect vdparams;
+    struct mp_rect window_size;
+    struct wl_list output_list;
+    struct vo_wayland_output *current_output;
+    int gcd;
+    int reduced_height;
+    int reduced_width;
+    int toplevel_width;
+    int toplevel_height;
+
+    /* State */
+    bool activated;
+    bool has_keyboard_input;
+    bool focused;
+    bool frame_wait;
+    bool hidden;
+    bool state_change;
+    bool toplevel_configured;
+    int display_fd;
+    int mouse_unscaled_x;
+    int mouse_unscaled_y;
+    int mouse_x;
+    int mouse_y;
+    int pending_vo_events;
+    int scaling;
+    int timeout_count;
     int wakeup_pipe[2];
 
-    struct {
-        void *data;
-        vo_wayland_frame_cb function;
-        struct wl_callback *callback;
-    } frame;
+    /* idle-inhibit */
+    struct zwp_idle_inhibit_manager_v1 *idle_inhibit_manager;
+    struct zwp_idle_inhibitor_v1 *idle_inhibitor;
 
-#if HAVE_GL_WAYLAND
-    struct {
-        EGLSurface egl_surface;
+    /* linux-dmabuf */
+    struct zwp_linux_dmabuf_v1 *dmabuf;
+    int *drm_formats;
+    int drm_format_ct;
+    int drm_format_ct_max;
 
-        struct wl_egl_window *egl_window;
+    /* presentation-time */
+    struct wp_presentation  *presentation;
+    struct wp_presentation_feedback *feedback;
+    struct mp_present *present;
+    int64_t refresh_interval;
 
-        struct {
-            EGLDisplay dpy;
-            EGLContext ctx;
-            EGLConfig conf;
-        } egl;
-    } egl_context;
-#endif
+    /* xdg-decoration */
+    struct zxdg_decoration_manager_v1 *xdg_decoration_manager;
+    struct zxdg_toplevel_decoration_v1 *xdg_toplevel_decoration;
+    int requested_decoration;
 
-    struct {
-        int fd;
-        struct wl_display *display;
-        struct wl_registry *registry;
-        struct wl_compositor *compositor;
-        struct wl_shell *shell;
+    /* xdg-shell */
+    struct xdg_wm_base      *wm_base;
+    struct xdg_surface      *xdg_surface;
+    struct xdg_toplevel     *xdg_toplevel;
 
-        struct wl_list output_list;
-        struct wl_output *fs_output; /* fullscreen output */
-        struct vo_wayland_output *current_output;
+    /* viewporter */
+    struct wp_viewporter *viewporter;
+    struct wp_viewport   *viewport;
+    struct wp_viewport   *video_viewport;
 
-        int display_fd;
+    /* Input */
+    struct wl_keyboard *keyboard;
+    struct wl_pointer  *pointer;
+    struct wl_seat     *seat;
+    struct wl_touch    *touch;
+    struct xkb_context *xkb_context;
+    struct xkb_keymap  *xkb_keymap;
+    struct xkb_state   *xkb_state;
+    uint32_t keyboard_code;
 
-        struct wl_shm *shm;
+    /* DND */
+    struct wl_data_device *dnd_ddev;
+    struct wl_data_device_manager *dnd_devman;
+    struct wl_data_offer *dnd_offer;
+    enum mp_dnd_action dnd_action;
+    char *dnd_mime_type;
+    int dnd_fd;
+    int dnd_mime_score;
 
-        struct wl_subcompositor *subcomp;
-    } display;
-
-    struct {
-        int32_t width;    // current size of the window
-        int32_t height;
-        int32_t p_width;  // previous sizes for leaving fullscreen
-        int32_t p_height;
-        int32_t sh_width; // sheduled width for resizing
-        int32_t sh_height;
-        int32_t sh_x;     // x, y calculated with the drag edges for moving
-        int32_t sh_y;
-        float aspect;
-
-        bool is_fullscreen; // don't keep aspect ratio in fullscreen mode
-        int32_t fs_width;   // fullscreen sizes
-        int32_t fs_height;
-
-        struct wl_surface *video_surface;
-        int32_t mouse_x; // mouse position inside the surface
-        int32_t mouse_y;
-        struct wl_shell_surface *shell_surface;
-        int events; /* mplayer events (VO_EVENT_RESIZE) */
-    } window;
-
-    struct {
-        struct wl_cursor *default_cursor;
-        struct wl_cursor_theme *theme;
-        struct wl_surface *surface;
-
-        /* pointer for fading out */
-        bool visible;
-        struct wl_pointer *pointer;
-        uint32_t serial;
-    } cursor;
-
-    struct {
-        struct wl_seat *seat;
-        struct wl_keyboard *keyboard;
-        struct wl_pointer *pointer;
-
-        struct {
-            struct xkb_context *context;
-            struct xkb_keymap *keymap;
-            struct xkb_state *state;
-        } xkb;
-    } input;
+    /* Cursor */
+    struct wl_cursor_theme *cursor_theme;
+    struct wl_cursor       *default_cursor;
+    struct wl_surface      *cursor_surface;
+    bool                    cursor_visible;
+    int                     allocated_cursor_scale;
+    uint32_t                pointer_id;
 };
 
-int vo_wayland_init(struct vo *vo);
-void vo_wayland_uninit(struct vo *vo);
-bool vo_wayland_config(struct vo *vo);
+bool vo_wayland_check_visible(struct vo *vo);
+bool vo_wayland_supported_format(struct vo *vo, uint32_t format);
+
+int vo_wayland_allocate_memfd(struct vo *vo, size_t size);
 int vo_wayland_control(struct vo *vo, int *events, int request, void *arg);
-void vo_wayland_wakeup(struct vo *vo);
+int vo_wayland_init(struct vo *vo);
+int vo_wayland_reconfig(struct vo *vo);
+
+void vo_wayland_set_opaque_region(struct vo_wayland_state *wl, int alpha);
+void vo_wayland_sync_swap(struct vo_wayland_state *wl);
+void vo_wayland_uninit(struct vo *vo);
 void vo_wayland_wait_events(struct vo *vo, int64_t until_time_us);
-void vo_wayland_request_frame(struct vo *vo, void *data, vo_wayland_frame_cb cb);
+void vo_wayland_wait_frame(struct vo_wayland_state *wl);
+void vo_wayland_wakeup(struct vo *vo);
 
 #endif /* MPLAYER_WAYLAND_COMMON_H */
-

@@ -3,18 +3,18 @@
  *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <inttypes.h>
@@ -23,6 +23,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <math.h>
 
 #include <ass/ass.h>
 #include <ass/ass_types.h>
@@ -78,6 +79,9 @@ void mp_ass_set_style(ASS_Style *style, double res_y,
     style->ScaleX = 1.;
     style->ScaleY = 1.;
     style->Alignment = 1 + (opts->align_x + 1) + (opts->align_y + 2) % 3 * 4;
+#ifdef ASS_JUSTIFY_LEFT
+    style->Justify = opts->justify;
+#endif
     style->Blur = opts->blur;
     style->Bold = opts->bold;
     style->Italic = opts->italic;
@@ -93,8 +97,14 @@ void mp_ass_configure_fonts(ASS_Renderer *priv, struct osd_style_opts *opts,
     if (default_font && !mp_path_exists(default_font))
         default_font = NULL;
 
+    int font_provider = ASS_FONTPROVIDER_AUTODETECT;
+    if (opts->font_provider == 1)
+        font_provider = ASS_FONTPROVIDER_NONE;
+    if (opts->font_provider == 2)
+        font_provider = ASS_FONTPROVIDER_FONTCONFIG;
+
     mp_verbose(log, "Setting up fonts...\n");
-    ass_set_fonts(priv, default_font, opts->font, 1, config, 1);
+    ass_set_fonts(priv, default_font, opts->font, font_provider, config, 1);
     mp_verbose(log, "Done.\n");
 
     talloc_free(tmp);
@@ -106,8 +116,8 @@ static const int map_ass_level[] = {
     MSGL_INFO,
     MSGL_V,
     MSGL_V,
-    MSGL_V,             // 5 application recommended level
-    MSGL_DEBUG,
+    MSGL_DEBUG,         // 5 application recommended level
+    MSGL_TRACE,
     MSGL_TRACE,         // 7 "verbose DEBUG"
 };
 
@@ -125,13 +135,14 @@ static void message_callback(int level, const char *format, va_list va, void *ct
 ASS_Library *mp_ass_init(struct mpv_global *global, struct mp_log *log)
 {
     char *path = mp_find_config_file(NULL, global, "fonts");
+    mp_dbg(log, "ASS library version: 0x%x (runtime 0x%x)\n",
+           (unsigned)LIBASS_VERSION, ass_library_version());
     ASS_Library *priv = ass_library_init();
     if (!priv)
         abort();
     ass_set_message_cb(priv, message_callback, log);
     if (path)
         ass_set_fonts_dir(priv, path);
-    ass_set_extract_fonts(priv, global->opts->use_embedded_fonts);
     talloc_free(path);
     return priv;
 }
@@ -217,13 +228,21 @@ static bool pack(struct mp_ass_packer *p, struct sub_bitmaps *res, int imgfmt)
     res->packed_h = bb[1].y;
 
     if (!p->cached_img || p->cached_img->w < res->packed_w ||
-                          p->cached_img->h < res->packed_h)
+                          p->cached_img->h < res->packed_h ||
+                          p->cached_img->imgfmt != imgfmt)
     {
         talloc_free(p->cached_img);
         p->cached_img = mp_image_alloc(imgfmt, p->packer->w, p->packer->h);
-        if (!p->cached_img)
+        if (!p->cached_img) {
+            packer_reset(p->packer);
             return false;
+        }
         talloc_steal(p, p->cached_img);
+    }
+
+    if (!mp_image_make_writeable(p->cached_img)) {
+        packer_reset(p->packer);
+        return false;
     }
 
     res->packed = p->cached_img;
@@ -266,7 +285,7 @@ static bool pack_rgba(struct mp_ass_packer *p, struct sub_bitmaps *res)
 
     struct sub_bitmaps imgs = {
         .change_id = res->change_id,
-        .format = SUBBITMAP_RGBA,
+        .format = SUBBITMAP_BGRA,
         .parts = p->rgba_imgs,
         .num_parts = num_bb,
     };
@@ -322,7 +341,7 @@ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
                         int num_image_lists, bool image_lists_changed,
                         int preferred_osd_format, struct sub_bitmaps *out)
 {
-    int format = preferred_osd_format == SUBBITMAP_RGBA ? SUBBITMAP_RGBA
+    int format = preferred_osd_format == SUBBITMAP_BGRA ? SUBBITMAP_BGRA
                                                         : SUBBITMAP_LIBASS;
 
     if (p->cached_subs_valid && !image_lists_changed &&
@@ -360,7 +379,7 @@ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
     }
 
     bool r = false;
-    if (format == SUBBITMAP_RGBA) {
+    if (format == SUBBITMAP_BGRA) {
         r = pack_rgba(p, &res);
     } else {
         r = pack_libass(p, &res);
@@ -373,4 +392,28 @@ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
     p->cached_subs = res;
     p->cached_subs.change_id = 0;
     p->cached_subs_valid = true;
+}
+
+// Set *out_rc to [x0, y0, x1, y1] of the graphical bounding box in script
+// coordinates.
+// Set it to [inf, inf, -inf, -inf] if empty.
+void mp_ass_get_bb(ASS_Image *image_list, ASS_Track *track,
+                   struct mp_osd_res *res, double *out_rc)
+{
+    double rc[4] = {INFINITY, INFINITY, -INFINITY, -INFINITY};
+
+    for (ASS_Image *img = image_list; img; img = img->next) {
+        if (img->w == 0 || img->h == 0)
+            continue;
+        rc[0] = MPMIN(rc[0], img->dst_x);
+        rc[1] = MPMIN(rc[1], img->dst_y);
+        rc[2] = MPMAX(rc[2], img->dst_x + img->w);
+        rc[3] = MPMAX(rc[3], img->dst_y + img->h);
+    }
+
+    double scale = track->PlayResY / (double)MPMAX(res->h, 1);
+    if (scale > 0) {
+        for (int i = 0; i < 4; i++)
+            out_rc[i] = rc[i] * scale;
+    }
 }

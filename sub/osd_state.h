@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 
+#include "osdep/atomic.h"
 #include "osd.h"
 
 enum mp_osdtype {
@@ -22,6 +23,9 @@ struct ass_state {
     struct ass_track *track;
     struct ass_renderer *render;
     struct ass_library *library;
+    int res_x, res_y;
+    bool changed;
+    struct mp_osd_res vo_res; // last known value
 };
 
 struct osd_object {
@@ -37,7 +41,7 @@ struct osd_object {
     struct dec_sub *sub;
 
     // OSDTYPE_EXTERNAL
-    struct osd_external *externals;
+    struct osd_external **externals;
     int num_externals;
 
     // OSDTYPE_EXTERNAL2
@@ -46,18 +50,18 @@ struct osd_object {
     // VO cache state
     int vo_change_id;
     struct mp_osd_res vo_res;
+    bool vo_had_output;
 
     // Internally used by osd_libass.c
     bool changed;
     struct ass_state ass;
     struct mp_ass_packer *ass_packer;
+    struct sub_bitmap_copy_cache *copy_cache;
     struct ass_image **ass_imgs;
 };
 
 struct osd_external {
-    void *id;
-    char *text;
-    int res_x, res_y;
+    struct osd_external_ass ov;
     struct ass_state ass;
 };
 
@@ -67,16 +71,24 @@ struct osd_state {
     struct osd_object *objs[MAX_OSD_PARTS];
 
     bool render_subs_in_filter;
-    double force_video_pts;
+    mp_atomic_double force_video_pts;
 
     bool want_redraw;
     bool want_redraw_notification;
 
-    struct MPOpts *opts;
+    struct m_config_cache *opts_cache;
+    struct mp_osd_render_opts *opts;
     struct mpv_global *global;
     struct mp_log *log;
+    struct stats_ctx *stats;
 
     struct mp_draw_sub_cache *draw_cache;
 };
+
+// defined in osd_libass.c
+struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
+                                           struct osd_object *obj, int format);
+void osd_init_backend(struct osd_state *osd);
+void osd_destroy_backend(struct osd_state *osd);
 
 #endif

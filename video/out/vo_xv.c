@@ -17,6 +17,7 @@
  * with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,12 +31,10 @@
 
 #include "config.h"
 
-#if HAVE_SHM && HAVE_XEXT
 #include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <X11/extensions/XShm.h>
-#endif
 
 // Note: depends on the inclusion of X11/extensions/XShm.h
 #include <X11/extensions/Xv.h>
@@ -46,7 +45,7 @@
 #include "common/msg.h"
 #include "vo.h"
 #include "video/mp_image.h"
-#include "video/img_fourcc.h"
+#include "present_sync.h"
 #include "x11_common.h"
 #include "sub/osd.h"
 #include "sub/draw_bmp.h"
@@ -93,11 +92,16 @@ struct xvctx {
     GC f_gc;    // used to paint background
     GC vo_gc;   // used to paint video
     int Shmem_Flag;
-#if HAVE_SHM && HAVE_XEXT
     XShmSegmentInfo Shminfo[MAX_BUFFERS];
     int Shm_Warned_Slow;
-#endif
 };
+
+#define MP_FOURCC(a,b,c,d) ((a) | ((b)<<8) | ((c)<<16) | ((unsigned)(d)<<24))
+
+#define MP_FOURCC_YV12  MP_FOURCC('Y', 'V', '1', '2')
+#define MP_FOURCC_I420  MP_FOURCC('I', '4', '2', '0')
+#define MP_FOURCC_IYUV  MP_FOURCC('I', 'Y', 'U', 'V')
+#define MP_FOURCC_UYVY  MP_FOURCC('U', 'Y', 'V', 'Y')
 
 struct fmt_entry {
     int imgfmt;
@@ -106,7 +110,6 @@ struct fmt_entry {
 static const struct fmt_entry fmt_table[] = {
     {IMGFMT_420P,       MP_FOURCC_YV12},
     {IMGFMT_420P,       MP_FOURCC_I420},
-    {IMGFMT_YUYV,       MP_FOURCC_YUY2},
     {IMGFMT_UYVY,       MP_FOURCC_UYVY},
     {0}
 };
@@ -537,7 +540,6 @@ static bool allocate_xvimage(struct vo *vo, int foo)
     int aligned_w = FFALIGN(ctx->image_width, 32);
     // round up the height to next chroma boundary too
     int aligned_h = FFALIGN(ctx->image_height, 2);
-#if HAVE_SHM && HAVE_XEXT
     if (x11->display_is_local && XShmQueryExtension(x11->display)) {
         ctx->Shmem_Flag = 1;
         x11->ShmCompletionEvent = XShmGetEventBase(x11->display)
@@ -567,9 +569,7 @@ static bool allocate_xvimage(struct vo *vo, int foo)
         XShmAttach(x11->display, &ctx->Shminfo[foo]);
         XSync(x11->display, False);
         shmctl(ctx->Shminfo[foo].shmid, IPC_RMID, 0);
-    } else
-#endif
-    {
+    } else {
         ctx->xvimage[foo] =
             (XvImage *) XvCreateImage(x11->display, ctx->xv_port,
                                       ctx->xv_format, NULL, aligned_w,
@@ -599,22 +599,17 @@ static bool allocate_xvimage(struct vo *vo, int foo)
 static void deallocate_xvimage(struct vo *vo, int foo)
 {
     struct xvctx *ctx = vo->priv;
-#if HAVE_SHM && HAVE_XEXT
     if (ctx->Shmem_Flag) {
         XShmDetach(vo->x11->display, &ctx->Shminfo[foo]);
         shmdt(ctx->Shminfo[foo].shmaddr);
-    } else
-#endif
-    {
+    } else {
         av_free(ctx->xvimage[foo]->data);
     }
     if (ctx->xvimage[foo])
         XFree(ctx->xvimage[foo]);
 
     ctx->xvimage[foo] = NULL;
-#if HAVE_SHM && HAVE_XEXT
     ctx->Shminfo[foo] = (XShmSegmentInfo){0};
-#endif
 
     XSync(vo->x11->display, False);
     return;
@@ -628,16 +623,14 @@ static inline void put_xvimage(struct vo *vo, XvImage *xvi)
     struct mp_rect *dst = &ctx->dst_rect;
     int dw = dst->x1 - dst->x0, dh = dst->y1 - dst->y0;
     int sw = src->x1 - src->x0, sh = src->y1 - src->y0;
-#if HAVE_SHM && HAVE_XEXT
+
     if (ctx->Shmem_Flag) {
         XvShmPutImage(x11->display, ctx->xv_port, x11->window, ctx->vo_gc, xvi,
                       src->x0, src->y0, sw, sh,
                       dst->x0, dst->y0, dw, dh,
                       True);
         x11->ShmCompletionWaitCount++;
-    } else
-#endif
-    {
+    } else {
         XvPutImage(x11->display, ctx->xv_port, x11->window, ctx->vo_gc, xvi,
                    src->x0, src->y0, sw, sh,
                    dst->x0, dst->y0, dw, dh);
@@ -672,7 +665,6 @@ static struct mp_image get_xv_buffer(struct vo *vo, int buf_index)
 
 static void wait_for_completion(struct vo *vo, int max_outstanding)
 {
-#if HAVE_SHM && HAVE_XEXT
     struct xvctx *ctx = vo->priv;
     struct vo_x11_state *x11 = vo->x11;
     if (ctx->Shmem_Flag) {
@@ -686,7 +678,6 @@ static void wait_for_completion(struct vo *vo, int max_outstanding)
             vo_x11_check_events(vo);
         }
     }
-#endif
 }
 
 static void flip_page(struct vo *vo)
@@ -699,6 +690,18 @@ static void flip_page(struct vo *vo)
 
     if (!ctx->Shmem_Flag)
         XSync(vo->x11->display, False);
+
+    if (vo->x11->use_present) {
+        vo_x11_present(vo);
+        present_sync_swap(vo->x11->present);
+    }
+}
+
+static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
+{
+    struct vo_x11_state *x11 = vo->x11;
+    if (x11->use_present)
+        present_sync_get_info(x11->present, info);
 }
 
 // Note: REDRAW_FRAME can call this with NULL.
@@ -707,6 +710,9 @@ static void draw_image(struct vo *vo, mp_image_t *mpi)
     struct xvctx *ctx = vo->priv;
 
     wait_for_completion(vo, ctx->num_buffers - 1);
+    bool render = vo_x11_check_visible(vo);
+    if (!render)
+        return;
 
     struct mp_image xv_buffer = get_xv_buffer(vo, ctx->current_buf);
     if (mpi) {
@@ -873,15 +879,6 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_SET_PANSCAN:
         resize(vo);
         return VO_TRUE;
-    case VOCTRL_SET_EQUALIZER: {
-        vo->want_redraw = true;
-        struct voctrl_set_equalizer_args *args = data;
-        return xv_set_eq(vo, ctx->xv_port, args->name, args->value);
-    }
-    case VOCTRL_GET_EQUALIZER: {
-        struct voctrl_get_equalizer_args *args = data;
-        return xv_get_eq(vo, ctx->xv_port, args->name, args->valueptr);
-    }
     case VOCTRL_REDRAW_FRAME:
         draw_image(vo, ctx->original_image);
         return true;
@@ -905,6 +902,7 @@ const struct vo_driver video_out_xv = {
     .control = control,
     .draw_image = draw_image,
     .flip_page = flip_page,
+    .get_vsync = get_vsync,
     .wakeup = vo_x11_wakeup,
     .wait_events = vo_x11_wait_events,
     .uninit = uninit,
@@ -917,20 +915,20 @@ const struct vo_driver video_out_xv = {
         .cfg_buffers = 2,
     },
     .options = (const struct m_option[]) {
-        OPT_INT("port", xv_port, M_OPT_MIN, .min = 0),
-        OPT_INT("adaptor", cfg_xv_adaptor, M_OPT_MIN, .min = -1),
-        OPT_CHOICE("ck", xv_ck_info.source, 0,
-                   ({"use", CK_SRC_USE},
-                    {"set", CK_SRC_SET},
-                    {"cur", CK_SRC_CUR})),
-        OPT_CHOICE("ck-method", xv_ck_info.method, 0,
-                   ({"none", CK_METHOD_NONE},
-                    {"bg", CK_METHOD_BACKGROUND},
-                    {"man", CK_METHOD_MANUALFILL},
-                    {"auto", CK_METHOD_AUTOPAINT})),
-        OPT_INT("colorkey", colorkey, 0),
-        OPT_INTRANGE("buffers", cfg_buffers, 0, 1, MAX_BUFFERS),
-        OPT_REMOVED("no-colorkey", "use ck-method=none instead"),
+        {"port", OPT_INT(xv_port), M_RANGE(0, DBL_MAX)},
+        {"adaptor", OPT_INT(cfg_xv_adaptor), M_RANGE(-1, DBL_MAX)},
+        {"ck", OPT_CHOICE(xv_ck_info.source,
+            {"use", CK_SRC_USE},
+            {"set", CK_SRC_SET},
+            {"cur", CK_SRC_CUR})},
+        {"ck-method", OPT_CHOICE(xv_ck_info.method,
+            {"none", CK_METHOD_NONE},
+            {"bg", CK_METHOD_BACKGROUND},
+            {"man", CK_METHOD_MANUALFILL},
+            {"auto", CK_METHOD_AUTOPAINT})},
+        {"colorkey", OPT_INT(colorkey)},
+        {"buffers", OPT_INT(cfg_buffers), M_RANGE(1, MAX_BUFFERS)},
+        {"no-colorkey", OPT_REMOVED("use ck-method=none instead")},
         {0}
     },
     .options_prefix = "xv",

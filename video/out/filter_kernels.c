@@ -28,6 +28,7 @@
 #include <assert.h>
 
 #include "filter_kernels.h"
+#include "common/common.h"
 
 // NOTE: all filters are designed for discrete convolution
 
@@ -60,19 +61,20 @@ bool mp_init_filter(struct filter_kernel *filter, const int *sizes,
 {
     assert(filter->f.radius > 0);
     // Only downscaling requires widening the filter
-    filter->inv_scale = inv_scale >= 1.0 ? inv_scale : 1.0;
-    filter->f.radius *= filter->inv_scale;
+    filter->filter_scale = MPMAX(1.0, inv_scale);
+    double src_radius = filter->f.radius * filter->filter_scale;
     // Polar filters are dependent solely on the radius
     if (filter->polar) {
-        filter->size = 1;
+        filter->size = 1; // Not meaningful for EWA/polar scalers.
         // Safety precaution to avoid generating a gigantic shader
-        if (filter->f.radius > 16.0) {
-            filter->f.radius = 16.0;
+        if (src_radius > 16.0) {
+            src_radius = 16.0;
+            filter->filter_scale = src_radius / filter->f.radius;
             return false;
         }
         return true;
     }
-    int size = ceil(2.0 * filter->f.radius);
+    int size = ceil(2.0 * src_radius);
     // round up to smallest available size that's still large enough
     if (size < sizes[0])
         size = sizes[0];
@@ -87,7 +89,7 @@ bool mp_init_filter(struct filter_kernel *filter, const int *sizes,
         // largest filter available. This is incorrect, but better than refusing
         // to do anything.
         filter->size = cursize[-1];
-        filter->inv_scale *= (filter->size/2.0) / filter->f.radius;
+        filter->filter_scale = (filter->size/2.0) / filter->f.radius;
         return false;
     }
 }
@@ -100,14 +102,14 @@ static double sample_window(struct filter_window *kernel, double x)
 
     // All windows are symmetric, this makes life easier
     x = fabs(x);
-    if (x >= kernel->radius)
-        return 0.0;
 
     // Stretch and taper the window size as needed
     x = kernel->blur > 0.0 ? x / kernel->blur : x;
     x = x <= kernel->taper ? 0.0 : (x - kernel->taper) / (1 - kernel->taper);
 
-    return kernel->weight(kernel, x);
+    if (x < kernel->radius)
+        return kernel->weight(kernel, x);
+    return 0.0;
 }
 
 // Evaluate a filter's kernel and window at a given absolute position
@@ -115,8 +117,8 @@ static double sample_filter(struct filter_kernel *filter, double x)
 {
     // The window is always stretched to the entire kernel
     double w = sample_window(&filter->w, x / filter->f.radius * filter->w.radius);
-    double k = sample_window(&filter->f, x / filter->inv_scale);
-    return filter->clamp ? fmax(0.0, fmin(1.0, w * k)) : w * k;
+    double k = w * sample_window(&filter->f, x);
+    return k < 0 ? (1 - filter->clamp) * k : k;
 }
 
 // Calculate the 1D filtering kernel for N sample points.
@@ -130,7 +132,7 @@ static void mp_compute_weights(struct filter_kernel *filter, double f,
     double sum = 0;
     for (int n = 0; n < filter->size; n++) {
         double x = f - (n - filter->size / 2 + 1);
-        double w = sample_filter(filter, x);
+        double w = sample_filter(filter, x / filter->filter_scale);
         out_w[n] = w;
         sum += w;
     }
@@ -140,26 +142,33 @@ static void mp_compute_weights(struct filter_kernel *filter, double f,
 }
 
 // Fill the given array with weights for the range [0.0, 1.0]. The array is
-// interpreted as rectangular array of count * filter->size items.
+// interpreted as rectangular array of count * filter->size items, with a
+// stride of `stride` floats in between each array element. (For polar filters,
+// the `count` indicates the row size and filter->size/stride are ignored)
 //
 // There will be slight sampling error if these weights are used in a OpenGL
 // texture as LUT directly. The sampling point of a texel is located at its
 // center, so out_array[0] will end up at 0.5 / count instead of 0.0.
 // Correct lookup requires a linear coordinate mapping from [0.0, 1.0] to
 // [0.5 / count, 1.0 - 0.5 / count].
-void mp_compute_lut(struct filter_kernel *filter, int count, float *out_array)
+void mp_compute_lut(struct filter_kernel *filter, int count, int stride,
+                    float *out_array)
 {
     if (filter->polar) {
+        filter->radius_cutoff = 0.0;
         // Compute a 1D array indexed by radius
         for (int x = 0; x < count; x++) {
             double r = x * filter->f.radius / (count - 1);
             out_array[x] = sample_filter(filter, r);
+
+            if (fabs(out_array[x]) > filter->value_cutoff)
+                filter->radius_cutoff = r;
         }
     } else {
         // Compute a 2D array indexed by subpixel position
         for (int n = 0; n < count; n++) {
             mp_compute_weights(filter, n / (double)(count - 1),
-                               out_array + filter->size * n);
+                               out_array + stride * n);
         }
     }
 }
@@ -178,6 +187,11 @@ static double triangle(params *p, double x)
     return fmax(0.0, 1.0 - fabs(x / p->radius));
 }
 
+static double cosine(params *p, double x)
+{
+    return cos(x);
+}
+
 static double hanning(params *p, double x)
 {
     return 0.5 + 0.5 * cos(M_PI * x);
@@ -190,7 +204,7 @@ static double hamming(params *p, double x)
 
 static double quadric(params *p, double x)
 {
-    if (x <  0.75) {
+    if (x <  0.5) {
         return 0.75 - x * x;
     } else if (x <  1.5) {
         double t = x - 1.5;
@@ -287,13 +301,13 @@ static double spline36(params *p, double x)
 static double spline64(params *p, double x)
 {
     if (x < 1.0) {
-        return ((49.0/41.0 * x - 6387.0/2911.0) * x - 3.0/911.0) * x + 1.0;
+        return ((49.0/41.0 * x - 6387.0/2911.0) * x - 3.0/2911.0) * x + 1.0;
     } else if (x < 2.0) {
-        return ((-24.0/42.0 * (x-1) + 4032.0/2911.0) * (x-1) - 2328.0/ 2911.0) * (x-1);
+        return ((-24.0/41.0 * (x-1) + 4032.0/2911.0) * (x-1) - 2328.0/2911.0) * (x-1);
     } else if (x < 3.0) {
-        return ((6.0/41.0 * (x-2) - 1008.0/2911.0) * (x-2) +  582.0/2911.0) * (x-2);
+        return ((6.0/41.0 * (x-2) - 1008.0/2911.0) * (x-2) + 582.0/2911.0) * (x-2);
     } else {
-        return ((-1.0/41.0 * (x-3) - 168.0/2911.0) * (x-3) +  97.0/2911.0) * (x-3);
+        return ((-1.0/41.0 * (x-3) + 168.0/2911.0) * (x-3) - 97.0/2911.0) * (x-3);
     }
 }
 
@@ -330,6 +344,7 @@ const struct filter_window mp_filter_windows[] = {
     {"box",            1,   box},
     {"triangle",       1,   triangle},
     {"bartlett",       1,   triangle},
+    {"cosine",         M_PI_2, cosine},
     {"hanning",        1,   hanning},
     {"tukey",          1,   hanning, .taper = 0.5},
     {"hamming",        1,   hamming},
@@ -367,7 +382,7 @@ const struct filter_kernel mp_filter_kernels[] = {
     {{"ewa_lanczossoft", 3.2383154841662362, jinc, .blur = 1.015,
           .resizable = true}, .polar = true, .window = "jinc"},
     // Very soft (blurred) hanning-windowed jinc; removes almost all aliasing.
-    // Blur paramater picked to match orthogonal and diagonal contributions
+    // Blur parameter picked to match orthogonal and diagonal contributions
     {{"haasnsoft", 3.2383154841662362, jinc, .blur = 1.11, .resizable = true},
           .polar = true, .window = "hanning"},
     // Cubic filters

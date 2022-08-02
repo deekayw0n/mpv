@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "config.h"
@@ -127,13 +127,7 @@ int m_config_parse(m_config_t *config, const char *location, bstr data,
             goto error;
         }
 
-        int res;
-        if (bstr_equals0(option, "profile-desc")) {
-            m_profile_set_desc(profile, value);
-            res = 0;
-        } else {
-            res = m_config_set_profile_option(config, profile, option, value);
-        }
+        int res = m_config_set_profile_option(config, profile, option, value);
         if (res < 0) {
             MP_ERR(config, "%s setting option %.*s='%.*s' failed.\n",
                    loc, BSTR_P(option), BSTR_P(value));
@@ -150,7 +144,8 @@ int m_config_parse(m_config_t *config, const char *location, bstr data,
         }
     }
 
-    m_config_finish_default_profile(config, flags);
+    if (config->recursion_depth == 0)
+        m_config_finish_default_profile(config, flags);
 
     talloc_free(tmp);
     return 1;
@@ -181,10 +176,10 @@ static bstr read_file(struct mp_log *log, const char *filename)
         }
         size += s;
     }
-    assert(0);
+    MP_ASSERT_UNREACHABLE();
 }
 
-// Load options and profiles from from a config file.
+// Load options and profiles from a config file.
 //  conffile: path to the config file
 //  initial_section: default section where to add normal options
 //  flags: M_SETOPT_* bits
